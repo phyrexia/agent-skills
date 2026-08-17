@@ -1,3 +1,14 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# .ai-memory derived or private state
+.ai-memory/.env
+.ai-memory/.venv
+.ai-memory/vectordb/*
+!.ai-memory/vectordb/.gitkeep
+.ai-memory/graphdb/*.lock
+.ai-memory/graphdb/.*.lock
+.ai-memory/audit.log
+.ai-memory/backups/
+.ai-memory/trash/
