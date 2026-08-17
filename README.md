@@ -15,10 +15,14 @@ repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles
 - `autoreview`: structured closeout/code-review workflow plus helper script.
 - `behavior-validator`: source-blind validation of user-visible behavior against
   a contract.
+- [`beam`](skills/beam/README.md): self-contained, authenticated, redacted
+  publication of local coding sessions to a read-only OpenClaw catalog.
 - `crabbox`: Crabbox/Testbox remote validation workflow for broad or CI-parity
   proof.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
   agent.
+- `readme-standard`: house README structure, badge row, tone, and verification
+  gates for steipete/openclaw repos.
 - `session-viewer`: local searchable HTML viewer for agent session JSONL.
 
 Repo-specific product skills should stay in the repo they describe. For example,
@@ -140,6 +144,11 @@ skills/
   behavior-validator/
     SKILL.md
     references/
+  beam/
+    README.md
+    SKILL.md
+    references/
+    scripts/
   crabbox/
     SKILL.md
   handoff/
@@ -178,7 +187,9 @@ python3 skills/autoreview/scripts/autoreview --self-test-opencode-isolation
 python3 skills/autoreview/scripts/autoreview --self-test-cursor-jsonl-parser
 python3 -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening
 node --check skills/agent-transcript/scripts/agent-transcript
-node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
+node --check skills/beam/scripts/beam
+node --check skills/beam/scripts/beam-session.js
+node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
 ```
 
 The validator checks every `skills/*/SKILL.md` for YAML frontmatter plus required
