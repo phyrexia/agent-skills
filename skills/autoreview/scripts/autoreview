@@ -194,9 +194,9 @@ SECRET_ASSIGNMENT_KEY_PATTERN = (
 )
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     rf"(?i){SECRET_ASSIGNMENT_KEY_PATTERN}\s*[:=]\s*"
-    r"(?:\"(?P<double_value>[^\"\r\n]{8,})\"|"
-    r"'(?P<single_value>[^'\r\n]{8,})'|"
-    r"`(?P<backtick_value>[^`\r\n]{8,})`|"
+    r"(?:\"(?P<double_value>[^\"\r\n]{7,})\"|"
+    r"'(?P<single_value>[^'\r\n]{7,})'|"
+    r"`(?P<backtick_value>[^`\r\n]{7,})`|"
     r"(?P<call_value>[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?=[ \t]*\()|"
     r"(?P<reference_value>[A-Za-z_$][A-Za-z0-9_$]*"
@@ -299,6 +299,40 @@ SECRET_PLACEHOLDER_VALUES = {
     "clawrouter-e2e-secret",
     "very-long-browser-token-0123456789",
 }
+EXPLICIT_TEMPLATE_MARKER_TEXT = (
+    r"(?:<[A-Z_][A-Z0-9_.-]*>"
+    r"|\$\{[A-Z_][A-Z0-9_.-]*\}"
+    r"|\{\{\s*[A-Z_][A-Z0-9_.-]*\s*\}\})"
+)
+EXPLICIT_TEMPLATE_MARKER_PATTERN = re.compile(EXPLICIT_TEMPLATE_MARKER_TEXT)
+EXPLICIT_TEMPLATE_LITERAL_WORDS = frozenset(
+    {"dev", "example", "perfectpath", "prod", "qa", "sample", "staging", "test"}
+)
+EXPLICIT_TEMPLATE_ATOM_TEXT = (
+    rf"(?:{EXPLICIT_TEMPLATE_MARKER_TEXT}|"
+    + "|".join(sorted(EXPLICIT_TEMPLATE_LITERAL_WORDS))
+    + r")"
+)
+EXPLICIT_TEMPLATE_VALUE_PATTERN = re.compile(
+    rf"{EXPLICIT_TEMPLATE_ATOM_TEXT}"
+    rf"(?:[-_.:/]{EXPLICIT_TEMPLATE_ATOM_TEXT})*"
+)
+SQL_COLUMN_REFERENCE_PATTERN = re.compile(
+    r"(?P<qualifier>EXCLUDED|[a-z])\."
+    r"(?P<column>[a-z_][a-z0-9_]*)"
+)
+DOM_SELECTOR_ATTRIBUTE_PATTERN = re.compile(
+    r"\[(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*"
+    r"(?P<operator>[*^$|~]?=)\s*"
+    r"(?P<quote>[\"']?)(?P<value>[A-Za-z0-9_./:-]+)(?P=quote)\]"
+)
+SAFE_JAVASCRIPT_CREDENTIAL_REFERENCE_PATTERN = re.compile(
+    r"(?:qa|test)Credentials"
+)
+SAFE_JAVASCRIPT_CONFIG_MEMBER_REFERENCE_PATTERN = re.compile(
+    r"(?:configured|resolved|runtime)(?:Auth|Config|Settings)\."
+    r"(?P<member>[a-z_][a-z0-9_]*)"
+)
 FETCH_CREDENTIAL_MODE_VALUES = {"include", "omit", "same-origin"}
 URI_PASSWORD_PLACEHOLDER_VALUES = {
     "clawrouter-e2e-secret",
@@ -2181,6 +2215,8 @@ def top_level_fallback_suffix(
             stack.pop()
             cursor += 1
             continue
+        if not stack and char in ")]}":
+            return None
         fallback_depth = not stack or all(is_outer for _closer, is_outer in stack)
         if fallback_depth:
             if char == "," and not stack:
@@ -3788,6 +3824,182 @@ def shell_command_prefix(text: str, position: int) -> bool:
     )
 
 
+def quoted_literal_fragments(
+    expression: str,
+) -> tuple[tuple[int, int, str, str, bool], ...]:
+    fragments: list[tuple[int, int, str, str, bool]] = []
+
+    def line_terminator_end(start: int) -> int | None:
+        match = re.search(r"\r\n|[\r\n\u2028\u2029]", expression[start:])
+        return None if match is None else start + match.end()
+
+    def comment_boundary(position: int) -> bool:
+        return position == 0 or (
+            expression[position - 1].isspace()
+            or expression[position - 1] in "()[];,=:+-*%&|!?\"'`"
+        )
+
+    cursor = 0
+    while cursor < len(expression):
+        if expression.startswith("//", cursor) and comment_boundary(cursor):
+            comment_end = line_terminator_end(cursor + 2)
+            cursor = len(expression) if comment_end is None else comment_end
+            continue
+        if expression.startswith("/*", cursor) and comment_boundary(cursor):
+            comment_end = expression.find("*/", cursor + 2)
+            cursor = len(expression) if comment_end < 0 else comment_end + 2
+            continue
+        if expression[cursor] == "#" and comment_boundary(cursor):
+            comment_end = line_terminator_end(cursor + 1)
+            cursor = len(expression) if comment_end is None else comment_end
+            continue
+        quote = expression[cursor]
+        if quote not in {'"', "'", "`"}:
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        value: list[str] = []
+        closed = False
+        while cursor < len(expression):
+            char = expression[cursor]
+            if char in "\r\n\u2028\u2029":
+                break
+            if char == "\\" and cursor + 1 < len(expression):
+                escaped_end = (
+                    line_terminator_end(cursor + 1)
+                    if expression[cursor + 1] in "\r\n\u2028\u2029"
+                    else None
+                )
+                end = escaped_end if escaped_end is not None else cursor + 2
+                value.extend(expression[cursor:end])
+                cursor = end
+                continue
+            if char == quote:
+                cursor += 1
+                closed = True
+                break
+            value.append(char)
+            cursor += 1
+        fragments.append((start, cursor, quote, "".join(value), closed))
+        if not closed:
+            terminator_end = line_terminator_end(cursor)
+            cursor = len(expression) if terminator_end is None else terminator_end
+    return tuple(fragments)
+
+
+def literal_concatenation_separator(separator: str) -> bool:
+    cursor = 0
+    plus_seen = False
+    while cursor < len(separator):
+        if separator[cursor].isspace() or separator[cursor] in "()":
+            cursor += 1
+            continue
+        if separator.startswith("/*", cursor):
+            comment_end = separator.find("*/", cursor + 2)
+            if comment_end < 0:
+                return False
+            cursor = comment_end + 2
+            continue
+        if separator.startswith("//", cursor) or separator[cursor] == "#":
+            newline = re.search(
+                r"\r\n|[\r\n\u2028\u2029]",
+                separator[cursor + 1 :],
+            )
+            if newline is None:
+                return False
+            cursor += 1 + newline.end()
+            continue
+        if separator[cursor] == "+" and not plus_seen:
+            plus_seen = True
+            cursor += 1
+            continue
+        return False
+    return True
+
+
+def secret_literal_value_risk(
+    value: str,
+    minimum_length: int,
+    quote: str | None = None,
+) -> bool:
+    if len(value) < minimum_length:
+        return False
+    if value.lower() in SECRET_PLACEHOLDER_VALUES:
+        return False
+    if explicit_template_value(value):
+        return False
+    if any(pattern.fullmatch(value) for pattern in QUOTED_SECRET_REFERENCE_PATTERNS):
+        return False
+    if (
+        quote == "`"
+        and (
+            any(
+                pattern.fullmatch(value)
+                for pattern in BACKTICK_SECRET_REFERENCE_PATTERNS
+            )
+            or safe_backtick_secret_template(value)
+        )
+    ):
+        return False
+    return True
+
+
+def secret_literal_sequence_risk(
+    expression: str,
+    minimum_length: int,
+) -> bool:
+    combined = ""
+    combined_quote: str | None = None
+    previous_end: int | None = None
+    for start, end, quote, value, closed in quoted_literal_fragments(expression):
+        if not closed:
+            return True
+        if previous_end is None or not literal_concatenation_separator(
+            expression[previous_end:start]
+        ):
+            combined = value
+            combined_quote = quote
+        else:
+            combined += value
+            combined_quote = None
+        previous_end = end
+        if secret_literal_value_risk(
+            combined,
+            minimum_length,
+            combined_quote,
+        ):
+            return True
+    return False
+
+
+def secret_literal_material_risk(
+    expression: str,
+    minimum_length: int,
+) -> bool:
+    fragments = quoted_literal_fragments(expression)
+    if any(not closed for _start, _end, _quote, _value, closed in fragments):
+        return True
+    if not fragments:
+        return False
+    if any(
+        secret_literal_value_risk(value, minimum_length, quote)
+        for _start, _end, quote, value, _closed in fragments
+    ):
+        return True
+    if len(fragments) == 1:
+        return False
+    connected = all(
+        literal_concatenation_separator(
+            expression[previous[1] : following[0]]
+        )
+        for previous, following in zip(fragments, fragments[1:])
+    )
+    if connected:
+        return secret_literal_sequence_risk(expression, minimum_length)
+    return sum(len(fragment[3]) for fragment in fragments) >= minimum_length
+
+
 def secret_literal_risk(
     expression: str,
     minimum_length: int = 12,
@@ -3797,6 +4009,10 @@ def secret_literal_risk(
     if credentialed_uri_risk(expression) or basic_authorization_risk(expression) or any(
         pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
     ):
+        return True
+    # Los lenguajes concatenan literales cortos en una sola constante; medir
+    # cada fragmento por separado permitiría esconder una contraseña breve.
+    if secret_literal_sequence_risk(expression, minimum_length):
         return True
     value_pattern = re.compile(
         rf'"(?P<double>[^"\r\n]{{{minimum_length},}})"'
@@ -3835,17 +4051,232 @@ def secret_literal_risk(
     return False
 
 
+def sql_column_reference_assignment(
+    key: str,
+    separator: str,
+    value: str,
+) -> bool:
+    # Una referencia SQL no contiene el valor secreto: sólo nombra la misma
+    # columna en EXCLUDED o en un alias corto del upsert.
+    normalized_key = key.strip("\"'")
+    match = SQL_COLUMN_REFERENCE_PATTERN.fullmatch(value)
+    return (
+        separator == "="
+        and "_" in normalized_key
+        and match is not None
+        and match.group("column") == normalized_key
+    )
+
+
+def selector_member_reference_assignment(key: str, value: str) -> bool:
+    normalized_key = key.strip("\"'").lower()
+    return (
+        normalized_key == "password"
+        and re.fullmatch(
+            r"[A-Za-z_$][A-Za-z0-9_$]*\.password_selector",
+            value,
+        )
+        is not None
+    )
+
+
+def javascript_config_member_reference_assignment(key: str, value: str) -> bool:
+    normalized_key = key.strip("\"'")
+    match = SAFE_JAVASCRIPT_CONFIG_MEMBER_REFERENCE_PATTERN.fullmatch(value)
+    return (
+        "_" in normalized_key
+        and match is not None
+        and match.group("member") == normalized_key
+    )
+
+
+def explicit_template_value(value: str) -> bool:
+    if len(value) > 256:
+        return False
+    return (
+        EXPLICIT_TEMPLATE_MARKER_PATTERN.search(value) is not None
+        and EXPLICIT_TEMPLATE_VALUE_PATTERN.fullmatch(value) is not None
+    )
+
+
+def dom_selector_literal(value: str) -> bool:
+    if not value or len(value) > 512 or value != value.strip():
+        return False
+    attributes = tuple(DOM_SELECTOR_ATTRIBUTE_PATTERN.finditer(value))
+    for attribute in attributes:
+        name = attribute.group("name").lower()
+        operator = attribute.group("operator")
+        attribute_value = attribute.group("value").lower()
+        allowed = (
+            name == "name"
+            and operator == "="
+            and attribute_value in {"email", "password", "user", "username"}
+        ) or (
+            name == "type"
+            and operator == "="
+            and attribute_value in {"email", "password", "submit", "text"}
+        ) or (
+            name == "role"
+            and operator == "="
+            and attribute_value == "dialog"
+        ) or (
+            name == "action"
+            and operator == "*="
+            and attribute_value in {"login", "sign-in", "signin"}
+        )
+        if not allowed:
+            return False
+    masked = DOM_SELECTOR_ATTRIBUTE_PATTERN.sub("", value)
+    if any(char in masked for char in "[]\"'"):
+        return False
+    simple_selector = re.compile(
+        r"(?:(?:button|form|input)(?:[#.][a-z_][a-z0-9_-]*)*"
+        r"|[#.][a-z_][a-z0-9_-]*)"
+    )
+    branches = masked.split(",")
+    return bool(attributes) and all(
+        tokens
+        and all(simple_selector.fullmatch(token) for token in tokens)
+        for tokens in (branch.split() for branch in branches)
+    )
+
+
+def safe_await_secret_expression(
+    expression: str,
+    *,
+    allow_credential_resolver: bool,
+) -> bool:
+    credential_field = "cred_" + "secret"
+    resolver_pattern = (
+        r"\s*await\s+resolveQaCredentials\(\s*"
+        r"\{\s*id:\s*`\$\{[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\}:visual_capture`,\s*"
+        rf"{credential_field}:\s*configuredAuth\.{credential_field}\s*\}},\s*"
+        r'isProd\s*\?\s*"prod"\s*:\s*"staging"\s*,?\s*'
+        r"\)\s*\?\?\s*undefined\s*"
+    )
+    if allow_credential_resolver and re.fullmatch(
+        resolver_pattern,
+        expression,
+        re.DOTALL,
+    ):
+        return True
+    lookup = re.fullmatch(
+        r"\s*await\s+"
+        r"(?P<receiver>[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\."
+        r"(?P<method>includes|get)\(\s*"
+        r"(?P<quote>[\"'])(?P<argument>[^\"'\r\n]+)(?P=quote)\s*\)\s*",
+        expression,
+    )
+    if lookup is not None:
+        receiver = lookup.group("receiver").rsplit(".", 1)[-1].lower()
+        method = lookup.group("method")
+        argument = lookup.group("argument").lower()
+        if (
+            method == "includes"
+            and receiver in {"selector", "selectors"}
+            and argument == "password"
+        ):
+            return True
+        if (
+            method == "get"
+            and receiver in {"cfg", "config", "env", "headers", "settings"}
+            and argument in {"authorization", "password", "secret", "token"}
+        ):
+            return True
+    locator = re.fullmatch(
+        r"\s*await\s+[A-Za-z_$][A-Za-z0-9_$]*\.locator\(\s*"
+        r"(?P<quote>[\"'])(?P<selector>[^\"'\r\n]+)(?P=quote)\s*\)"
+        r"\.inputValue\(\s*\)\s*",
+        expression,
+    )
+    return locator is not None and dom_selector_literal(
+        locator.group("selector")
+    )
+
+
+def ternary_member_branch_prefix(
+    text: str,
+    start: int,
+    key: str,
+    separator: str,
+) -> bool:
+    if key.strip("\"'").lower() != "password" or separator != ":":
+        return False
+    line_start = max(
+        text.rfind("\n", 0, start),
+        text.rfind("\r", 0, start),
+    )
+    branch_prefix = text[line_start + 1 : start]
+    return re.fullmatch(
+        r"\s*\?\s*[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\.",
+        branch_prefix,
+    ) is not None
+
+
+def ternary_dom_selector_fallback(
+    text: str,
+    start: int,
+    key: str,
+    separator: str,
+    value: str,
+) -> bool:
+    return (
+        ternary_member_branch_prefix(text, start, key, separator)
+        and dom_selector_literal(value)
+    )
+
+
+def javascript_regex_exposes_source(suffix: str) -> bool:
+    return (
+        re.search(
+            r"(?:(?:\?\.|\.)\s*source\b"
+            r"|(?:\?\.|\.)?\s*\[\s*([\"'])source\1\s*\])",
+            suffix,
+            re.DOTALL,
+        )
+        is not None
+    )
+
+
+def javascript_regex_literal_risk(text: str, minimum_length: int) -> bool:
+    cursor = 0
+    while cursor < len(text):
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is None:
+            cursor += 1
+            continue
+        content_end = regex_tail_end(text, cursor + 1, regex_end)
+        exposes_source = javascript_regex_exposes_source(text[regex_end:])
+        if (
+            content_end is not None
+            and len(text[cursor + 1 : content_end - 1]) >= minimum_length
+            and exposes_source
+        ):
+            return True
+        cursor = regex_end
+    return False
+
+
 def fallback_secret_risk(
     text: str,
-    minimum_length: int = 8,
+    minimum_length: int = 7,
     *,
     javascript_dialect: str | None = None,
 ) -> bool:
+    expression = fallback_expression(
+        text,
+        typescript=javascript_dialect == "typescript",
+    )
+    if (
+        javascript_dialect is not None
+        and javascript_regex_literal_risk(expression, minimum_length)
+    ):
+        return True
     return secret_literal_risk(
-        fallback_expression(
-            text,
-            typescript=javascript_dialect == "typescript",
-        ),
+        expression,
         minimum_length=minimum_length,
         javascript_dialect=javascript_dialect,
     )
@@ -5121,6 +5552,17 @@ def secret_text_risk(
         assignment_scan_text,
         safe_uri_credentials,
     )
+    assignment_matches = secret_assignment_matches(
+        SECRET_ASSIGNMENT_PATTERN,
+        text,
+        assignment_scan_text,
+        safe_uri_credentials,
+    )
+    assignment_match_starts = {match.start() for match in assignment_matches}
+    prefix_contexts = string_contexts_at(
+        text,
+        {prefix.start() for prefix in assignment_prefixes},
+    )
     chained_assignment_positions = top_level_line_assignment_positions(
         text,
         {prefix.start() for prefix in assignment_prefixes},
@@ -5131,6 +5573,22 @@ def secret_text_risk(
         else frozenset()
     )
     for prefix in assignment_prefixes:
+        if (
+            prefix.start() not in assignment_match_starts
+            and prefix_contexts.get(prefix.start()) is None
+        ):
+            assignment_expression = fallback_expression(
+                text[prefix.end() :],
+                typescript=javascript_dialect == "typescript",
+            )
+            if (
+                not safe_await_secret_expression(
+                    assignment_expression,
+                    allow_credential_resolver=javascript_dialect is not None,
+                )
+                and secret_literal_material_risk(assignment_expression, 7)
+            ):
+                return True
         fallback = top_level_fallback_suffix(
             text[prefix.end() :],
             allow_chained_assignment=(
@@ -5143,12 +5601,7 @@ def secret_text_risk(
             javascript_dialect=javascript_dialect,
         ):
             return True
-    for match in secret_assignment_matches(
-        SECRET_ASSIGNMENT_PATTERN,
-        text,
-        assignment_scan_text,
-        safe_uri_credentials,
-    ):
+    for match in assignment_matches:
         quoted = any(
             match.group(name) is not None
             for name in ("double_value", "single_value", "backtick_value")
@@ -5167,6 +5620,22 @@ def secret_text_risk(
         separator_match = re.search(r"[:=]", match.group(0))
         assert separator_match is not None
         separator = separator_match.group(0)
+        if (
+            quoted
+            and ternary_dom_selector_fallback(
+                text,
+                match.start(),
+                key,
+                separator,
+                value,
+            )
+            and safe_secret_assignment_suffix(
+                text,
+                match.end(),
+                javascript_dialect=javascript_dialect,
+            )
+        ):
+            continue
         if (
             key.strip("\"'").lower() == "credentials"
             and value.lower() in FETCH_CREDENTIAL_MODE_VALUES
@@ -5202,6 +5671,28 @@ def secret_text_risk(
                 continue
             return True
         if (
+            quoted
+            and explicit_template_value(value)
+            and safe_secret_assignment_suffix(
+                text,
+                match.end(),
+                javascript_dialect=javascript_dialect,
+            )
+        ):
+            continue
+        if (
+            match.group("bare_value") is not None
+            and javascript_dialect is not None
+            and key.strip("\"'").lower() == "credentials"
+            and SAFE_JAVASCRIPT_CREDENTIAL_REFERENCE_PATTERN.fullmatch(value)
+            and safe_javascript_reference_suffix(
+                text,
+                match.end(),
+                typescript=javascript_dialect == "typescript",
+            )
+        ):
+            continue
+        if (
             match.group("bare_value") is not None
             and len(value) < 12
             and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", value)
@@ -5230,6 +5721,33 @@ def secret_text_risk(
         ):
             continue
         if not quoted:
+            if (
+                match.group("reference_value") is not None
+                and sql_column_reference_assignment(key, separator, value)
+                and safe_secret_assignment_suffix(
+                    text,
+                    match.end(),
+                    javascript_dialect=javascript_dialect,
+                )
+            ):
+                continue
+            if (
+                match.group("reference_value") is not None
+                and javascript_dialect is not None
+                and (
+                    selector_member_reference_assignment(key, value)
+                    or javascript_config_member_reference_assignment(
+                        key,
+                        value,
+                    )
+                )
+                and safe_javascript_reference_suffix(
+                    text,
+                    match.end(),
+                    typescript=javascript_dialect == "typescript",
+                )
+            ):
+                continue
             source_start = match.end() - len(value)
             source_end = match.end() - (1 if value.endswith("!") else 0)
             if (

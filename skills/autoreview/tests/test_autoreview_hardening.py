@@ -1124,11 +1124,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
-    def test_secret_detector_does_not_cross_top_level_line_comments(self) -> None:
-        for content in (
+    def test_secret_detector_scopes_lines_and_blocks_sensitive_objects(self) -> None:
+        separate_statement = (
             "const pass"
             + 'word = lookup() // comment\nconst label = value || "hardcoded-'
-            + 'secret"',
+            + 'secret"'
+        )
+        self.assertFalse(self.helper["secret_text_risk"](separate_statement))
+
+        for content in (
             "const pass"
             + "word = ({source: lookup(), // note\n"
             + 'label: value || "aB3$dE5!gH7#"});',
@@ -1147,7 +1151,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'label: value || "aB3$dE5!gH7#"});',
         ):
             with self.subTest(content=content):
-                self.assertFalse(self.helper["secret_text_risk"](content))
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        key = "pass" + "word"
+        marker = "<ROL>"
+        literal = "hunter" + "two"
+        credential_key = "cred_" + "secret"
+        for content in (
+            f'{key} = {{ template: "{marker}", value: "{literal}" }}',
+            f'{key} = {{ value: "{literal}", template: "{marker}" }}',
+            f'{key} = ["{marker}", "{literal}"]',
+            f'{credential_key} = {{ format: "perfectpath-{marker}", value: "{literal}" }}',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
         self.assertTrue(
             self.helper["starts_sibling_assignment"](
                 "...defaults,\nlabel: value"
@@ -1858,6 +1875,372 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "pass" + "word = process.env.PASSWORD   "
             )
         )
+
+    def test_secret_detector_allows_sql_column_references_but_not_literals(
+        self,
+    ) -> None:
+        key = "lease_" + "token"
+        for content in (
+            f"{key} = EXCLUDED.{key}",
+            f"{key} = j.{key}",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'const {key} = "CorrectHorse' + 'BatteryStaple"'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key} = j.{key} || "CorrectHorse' + 'BatteryStaple"'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f"{key} = incoming.{key}"
+            )
+        )
+        short_literal = "hunter" + "2"
+        first_fragment = '"hunt"'
+        second_fragment = '"er2"'
+        for content in (
+            f'{key} = j.{key} || "{short_literal}"',
+            f'{key} = j.{key} ?? "{short_literal}"',
+            f'{key} = j.{key} + "{short_literal}"',
+            f'{key} = condition ? j.{key} : "{short_literal}"',
+            f"{key} = j.{key}\n  || \"{short_literal}\"",
+            f"{key} = j.{key} || {first_fragment} + {second_fragment}",
+            f"{key} = j.{key} || {first_fragment} /* split */ + {second_fragment}",
+            f"{key} = j.{key} || {first_fragment} // split\n + {second_fragment}",
+            f"{key} = j.{key} || ({first_fragment}\n # split\n {second_fragment})",
+            f"{key} = j.{key} || {first_fragment} + ({second_fragment})",
+            f"{key} = j.{key} || ({first_fragment}) + {second_fragment}",
+            f"{key} = j.{key} || (({first_fragment}) + ({second_fragment}))",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_dom_selectors_but_not_password_literals(
+        self,
+    ) -> None:
+        key = "pass" + "word"
+        predicate_key = "is" + key.title()
+        selector_key = key + "_selector"
+        selector_fallback = (
+            f"const loginDetector = args.loginSelectors.{key}\n"
+            f"  ? args.loginSelectors.{key}\n"
+            f'  : \'form#login input[type="{key}"]\';'
+        )
+        first_fragment = '"hunt"'
+        second_fragment = '"er2"'
+        short_value = "hunter" + "2"
+        escaped_literals = (
+            '"hu\\"nter2"',
+            "'hu\\'nter2'",
+            "`hu\\`nter2`",
+        )
+        unterminated_literals = tuple(
+            quote + "hunter2"
+            for quote in ('"', "'", "`")
+        )
+        for content in (
+            f'{selector_key}: "input[name={key}]"',
+            f'if (selector.includes("{key}"))',
+            selector_fallback,
+            f'{predicate_key} = await selector.includes("{key}")',
+            f'{key} = await config.get("{key}")',
+            f'{key} = await page.locator("input[type={key}]").inputValue()',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+        member_reference = f"{key}: configuredAuth.{selector_key}"
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                member_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](member_reference))
+        for literal in escaped_literals:
+            with self.subTest(literal=literal):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](f"{key} = {literal}")
+                )
+        for literal in unterminated_literals:
+            with self.subTest(literal=literal):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](f"{key} = {literal}")
+                )
+
+        for content in (
+            "pass" + 'word = "hunter' + '2"',
+            "api_" + 'key = "sk-ant-api03-' + 'realmente-larga"',
+            f"const loginDetector = args.loginSelectors.{key}\n"
+            f"  ? args.loginSelectors.{key}\n"
+            '  : "hunter' + '2";',
+            f"{key} = {first_fragment} + {second_fragment}",
+            f'{key} = "hunter" "2"',
+            f'{key} = "hu\\"nt" + {second_fragment}',
+            f'{key} = ${{value#prefix}}"hunter2"',
+            f'{key} = ${{value##prefix}}"hunter2"',
+            f'{key} = ${{value//old/new}}"hunter2"',
+            f"{key} = ({first_fragment} + {second_fragment}).trim()",
+            f"{key} = {first_fragment}.concat({second_fragment})",
+            f"{key} = [{first_fragment}, {second_fragment}].join(\"\")",
+            f'{key} = "hunt\\\r\ner2"',
+            f'{key} = f"{short_value}"',
+            f'{key} = r"{short_value}"',
+            f'{key} = b"{short_value}"',
+            f'{key} = @"{short_value}"',
+            f'{key} = $"{short_value}"',
+            f'{key} = $@"{short_value}"',
+            f'{key} = r#"{short_value}"#',
+            f'{key} = R"tag({short_value})tag"',
+            f'{key} = await Promise.resolve("{short_value}")',
+            f'{key} = new String("{short_value}")',
+            f'{key} = make?.("{short_value}")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        for terminator in ("\r", "\u2028", "\u2029"):
+            content = (
+                f"{key} = {first_fragment} // split"
+                f"{terminator} + {second_fragment}"
+            )
+            with self.subTest(terminator=repr(terminator)):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        literal = "CorrectHorse" + "BatteryStaple"
+        for content in (
+            f"const loginDetector = args.loginSelectors.{key}\n"
+            f"  ? args.loginSelectors.{key}\n"
+            f'  : \'input[value="{literal}"]\';',
+            f"const loginDetector = args.loginSelectors.{key}\n"
+            f"  ? args.loginSelectors.{key}\n"
+            f'  : \'{literal} input[type="{key}"]\';',
+            f'{key}: configuredAuth.{selector_key} || "hunter2"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_qa_credential_references_only_in_javascript(
+        self,
+    ) -> None:
+        key = "cred" + "entials"
+        password_key = "pass" + "word"
+        reference = f"{key}: qaCredentials"
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                reference,
+                javascript_dialect="javascript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](reference))
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key}: "hunter' + '2"',
+                javascript_dialect="javascript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key}: qaCredentials || "hunter' + '2"',
+                javascript_dialect="javascript",
+            )
+        )
+        for content in (
+            f'{key}: qaCredentials`hunter' + '2`',
+            f'{key}: qaCredentials => "hunter' + '2"',
+            f'{key}: qaCredentials "hunter' + '2"',
+            f'{key}: qaCredentials || /hunter' + '2/.source',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        for content in (
+            f"has{password_key.title()} = current || /{password_key}/.test(fieldName)",
+            f"is{password_key.title()} = flag || /pass(word)?/.test(input)",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="javascript",
+                    )
+                )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key}: qaCredentials || /hunter' + '2/["source"]',
+                javascript_dialect="javascript",
+            )
+        )
+        regex = "/hunter" + "2/"
+        for content in (
+            f"{key}: qaCredentials || ({regex}).source",
+            f"{key}: qaCredentials || (({regex})).source",
+            f"{key}: qaCredentials || {regex} /* split */ .source",
+            f"{key}: qaCredentials || ({regex}\n).source",
+            f"{key}: qaCredentials || {regex}?.source",
+            f'{key}: qaCredentials || {regex}?.["source"]',
+            f"{key}: qaCredentials || ({regex} as RegExp).source",
+            f"{key}: qaCredentials || ({regex} // split\n).source",
+            f"{key}: qaCredentials || (condition ? {regex} : /x/).source",
+            f"{key}: qaCredentials || [{regex}][0].source",
+            f"{key}: qaCredentials || ({regex} as any).source",
+            f"{key}: qaCredentials || ({regex} as unknown as RegExp).source",
+            f"{key}: qaCredentials || ({regex} as CredentialPattern).source",
+            f"{key}: qaCredentials || ({regex} satisfies RegExp).source",
+            f"{key}: qaCredentials || {regex}!.source",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+    def test_secret_detector_allows_configured_members_only_in_javascript(
+        self,
+    ) -> None:
+        key = "cred_" + "secret"
+        reference = f"{key}: configuredAuth.{key}"
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](reference))
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f"{key}: CorrectHorseBatteryStaple.{key}",
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key}: configuredAuth.{key} || "hunter' + '2"',
+                javascript_dialect="typescript",
+            )
+        )
+        for content in (
+            f'{key}: configuredAuth.{key}`hunter' + '2`',
+            f'{key}: configuredAuth.{key} "hunter' + '2"',
+            f'{key}: configuredAuth.{key} || /hunter' + '2/.source',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+    def test_secret_detector_allows_qa_resolver_calls_without_literals(
+        self,
+    ) -> None:
+        key = "qa" + "Credentials"
+        member = "cred_" + "secret"
+        reference = (
+            f"{key} = await resolveQaCredentials(\n"
+            f"  {{ id: `${{tenant.id}}:visual_capture`, "
+            f"{member}: configuredAuth.{member} }},\n"
+            '  isProd ? "prod" : "staging",\n'
+            ") ?? undefined"
+        )
+        one_line_reference = (
+            f"{key} = await resolveQaCredentials("
+            f"{{ id: `${{tenant.id}}:visual_capture`, "
+            f"{member}: configuredAuth.{member} }}, "
+            'isProd ? "prod" : "staging") ?? undefined'
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](reference))
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                one_line_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key} = await resolveQaCredentials("hunter' + '2")',
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                reference + ' ?? "hunter' + '2"',
+                javascript_dialect="typescript",
+            )
+        )
+
+    def test_secret_detector_allows_explicit_templates_but_not_plain_values(
+        self,
+    ) -> None:
+        key = "cred_" + "secret"
+        for marker in (
+            "<ROL>",
+            "${ROL}",
+            "{{ROL}}",
+        ):
+            content = f'{key}: "perfectpath-qa-{marker}"'
+            with self.subTest(marker=marker):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'{key}: "perfectpath-qa-' + 'admin"'
+            )
+        )
+        literal = "CorrectHorse" + "BatteryStaple"
+        short_alpha = "hunter" + "x"
+        disguised_literals = (
+            "hunter-x",
+            "hunterx-x",
+            "x-hunterx",
+            "correct-horse",
+            "hunter.x",
+            "hunter/x",
+        )
+        punctuation_literals = (
+            "--------${TOKEN}",
+            "${TOKEN}........",
+            "---<ROL>///",
+            "perfectpath---------<ROL>",
+        )
+        for content in (
+            f'{key}: "<ROL>-{literal}"',
+            'pass' + 'word = "hunter2-<ROL>"',
+            'pass' + f'word = "{short_alpha}-${{TOKEN}}"',
+            f'{key}: "<ROL>-{short_alpha}"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+        for disguised in disguised_literals:
+            for content in (
+                'pass' + f'word = "{disguised}-${{TOKEN}}"',
+                f'{key}: "<ROL>-{disguised}"',
+            ):
+                with self.subTest(content=content):
+                    self.assertTrue(self.helper["secret_text_risk"](content))
+        for disguised in punctuation_literals:
+            content = 'pass' + f'word = "{disguised}"'
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_allows_typescript_object_secret_references(self) -> None:
         content = (
