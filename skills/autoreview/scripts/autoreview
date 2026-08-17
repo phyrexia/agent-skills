@@ -50,6 +50,9 @@ SAFE_GIT_CONFIG_ARGS = (
     "pager.show=cat",
 )
 SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames")
+DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
+DIFF_HUNK_PARTIAL_MARKER = "\0autoreview-diff-hunk-partial\0"
+DIFF_HUNK_PARTIAL_TAIL_MARKER = "\0autoreview-diff-hunk-partial-tail\0"
 ENGINE_GIT_CONFIG_OVERRIDES = (
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -332,6 +335,66 @@ SAFE_JAVASCRIPT_CREDENTIAL_REFERENCE_PATTERN = re.compile(
 SAFE_JAVASCRIPT_CONFIG_MEMBER_REFERENCE_PATTERN = re.compile(
     r"(?:configured|resolved|runtime)(?:Auth|Config|Settings)\."
     r"(?P<member>[a-z_][a-z0-9_]*)"
+)
+CREDENTIAL_SECRET_FIELD = "cred_" + "secret"
+JAVASCRIPT_COMPOUND_ASSIGNMENT_PATTERN = re.compile(
+    r"\?\?=|\|\|=|&&=|\*\*=|<<=|>>>=|>>=|[+\-*/%&|^]="
+)
+JS_KEY_TRIVIA_TEXT = (
+    r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/"
+    r"|//[^\r\n\u2028\u2029]*(?:\r\n|[\r\n\u2028\u2029]|$))*"
+)
+JAVASCRIPT_LINE_TERMINATOR_PATTERN = re.compile(
+    r"\r\n|[\r\n\u2028\u2029]"
+)
+COMPOUND_CREDENTIAL_SECRET_LHS_PATTERN = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_$])(?:\(\s*)*(?:"
+    rf"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*"
+    rf"{CREDENTIAL_SECRET_FIELD}"
+    rf"|(?:[A-Za-z_$][A-Za-z0-9_$]*"
+    rf"(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*\s*)?"
+    rf"\[\s*(?P<compound_quote>[\"']){CREDENTIAL_SECRET_FIELD}"
+    rf"(?P=compound_quote)\s*\])(?:\s*\))*\s*$"
+)
+KEY_STRING_ESCAPE_TEXT = r"\\(?:\r\n|[\r\n\u2028\u2029]|.)"
+QUOTED_ASSIGNMENT_KEY_PATTERN = re.compile(
+    rf'"(?P<double>(?:{KEY_STRING_ESCAPE_TEXT}|[^"\\\r\n\u2028\u2029]){{1,128}})"'
+    rf"(?P<double_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+    rf"|'(?P<single>(?:{KEY_STRING_ESCAPE_TEXT}|[^'\\\r\n\u2028\u2029]){{1,128}})'"
+    rf"(?P<single_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+)
+COMPUTED_QUOTED_ASSIGNMENT_KEY_PATTERN = re.compile(
+    rf"\[{JS_KEY_TRIVIA_TEXT}"
+    rf'"(?P<computed_double>(?:{KEY_STRING_ESCAPE_TEXT}|[^"\\\r\n\u2028\u2029]){{1,128}})"'
+    rf"{JS_KEY_TRIVIA_TEXT}\]"
+    rf"(?P<computed_double_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+    rf"|\[{JS_KEY_TRIVIA_TEXT}"
+    rf"'(?P<computed_single>(?:{KEY_STRING_ESCAPE_TEXT}|[^'\\\r\n\u2028\u2029]){{1,128}})'"
+    rf"{JS_KEY_TRIVIA_TEXT}\]"
+    rf"(?P<computed_single_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+    rf"|\[{JS_KEY_TRIVIA_TEXT}"
+    rf"`(?P<computed_backtick>(?:{KEY_STRING_ESCAPE_TEXT}|[^`\\\r\n\u2028\u2029]){{1,128}})`"
+    rf"{JS_KEY_TRIVIA_TEXT}\]"
+    rf"(?P<computed_backtick_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+)
+IDENTIFIER_ESCAPE_TEXT = (
+    r"\\(?:\r\n|[\r\n\u2028\u2029]"
+    r"|u\{[0-9A-Fa-f]{1,6}\}|u[0-9A-Fa-f]{4}"
+    r"|x[0-9A-Fa-f]{2}|.)"
+)
+BARE_ESCAPED_ASSIGNMENT_KEY_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9_$])(?P<bare>(?:[A-Za-z_$]|{IDENTIFIER_ESCAPE_TEXT})"
+    rf"(?:[A-Za-z0-9_$]|{IDENTIFIER_ESCAPE_TEXT}){{0,127}})"
+    rf"(?P<bare_trivia>{JS_KEY_TRIVIA_TEXT})[:=]"
+)
+IDENTIFIER_ESCAPE_PATTERN = re.compile(
+    r"\\(?:(?P<continuation>\r\n|[\r\n\u2028\u2029])"
+    r"|u\{(?P<braced>[0-9A-Fa-f]{1,6})\}"
+    r"|u(?P<unicode>[0-9A-Fa-f]{4})"
+    r"|x(?P<hex>[0-9A-Fa-f]{2})"
+    r"|(?P<octal>[0-7]{1,3})"
+    r"|(?P<invalid_numeric>[89][0-9]{0,2})"
+    r"|(?P<simple>.))"
 )
 FETCH_CREDENTIAL_MODE_VALUES = {"include", "omit", "same-origin"}
 URI_PASSWORD_PLACEHOLDER_VALUES = {
@@ -4090,6 +4153,787 @@ def javascript_config_member_reference_assignment(key: str, value: str) -> bool:
     )
 
 
+def mirrored_javascript_reference_assignment(key: str, value: str) -> bool:
+    normalized_key = key.strip("\"'")
+    identifiers = value.split(".")
+    return (
+        len(identifiers) >= 2
+        and identifiers[-1] == normalized_key
+        and re.fullmatch(r"[a-z][A-Za-z0-9_$]*", identifiers[0]) is not None
+        and all(
+            re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", identifier)
+            is not None
+            for identifier in identifiers[1:]
+        )
+    )
+
+
+def decode_identifier_escapes(value: str) -> tuple[str, bool]:
+    invalid_escape = False
+
+    def replace_escape(escape: re.Match[str]) -> str:
+        nonlocal invalid_escape
+        if escape.group("continuation") is not None:
+            return ""
+        encoded = (
+            escape.group("braced")
+            or escape.group("unicode")
+            or escape.group("hex")
+        )
+        if escape.group("invalid_numeric") is not None:
+            invalid_escape = True
+            return ""
+        if escape.group("octal") is not None:
+            return chr(int(escape.group("octal"), 8))
+        if encoded is None:
+            return escape.group("simple")
+        codepoint = int(encoded, 16)
+        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            invalid_escape = True
+            return ""
+        return chr(codepoint)
+
+    return IDENTIFIER_ESCAPE_PATTERN.sub(replace_escape, value), invalid_escape
+
+
+def escaped_credential_secret_key_risk(text: str) -> bool:
+    raw_keys = [
+        (
+            match.group("double") or match.group("single"),
+            False,
+            (
+                match.group("double_trivia")
+                if match.group("double") is not None
+                else match.group("single_trivia")
+            ),
+        )
+        for match in QUOTED_ASSIGNMENT_KEY_PATTERN.finditer(text)
+    ] + [
+        (
+            match.group("computed_double")
+            or match.group("computed_single")
+            or match.group("computed_backtick"),
+            True,
+            (
+                match.group("computed_double_trivia")
+                if match.group("computed_double") is not None
+                else (
+                    match.group("computed_single_trivia")
+                    if match.group("computed_single") is not None
+                    else match.group("computed_backtick_trivia")
+                )
+            ),
+        )
+        for match in COMPUTED_QUOTED_ASSIGNMENT_KEY_PATTERN.finditer(text)
+    ] + [
+        (match.group("bare"), False, match.group("bare_trivia"))
+        for match in BARE_ESCAPED_ASSIGNMENT_KEY_PATTERN.finditer(text)
+    ]
+    for raw_key, computed, trivia in raw_keys:
+        if "\\" not in raw_key:
+            if raw_key.lower() == CREDENTIAL_SECRET_FIELD and (
+                computed or "/" in trivia
+            ):
+                return True
+            continue
+        decoded_key, invalid_escape = decode_identifier_escapes(raw_key)
+        if invalid_escape:
+            return True
+        if decoded_key.lower() == CREDENTIAL_SECRET_FIELD:
+            return True
+    return False
+
+
+def javascript_interpolation_end(text: str, start: int) -> int | None:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack = ["}"]
+    cursor = start + 1
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            line_end = JAVASCRIPT_LINE_TERMINATOR_PATTERN.search(
+                text,
+                cursor + 2,
+            )
+            cursor = (
+                len(text)
+                if line_end is None
+                else line_end.end()
+            )
+            continue
+        if text.startswith("/*", cursor):
+            comment_end = text.find("*/", cursor + 2)
+            if comment_end < 0:
+                return None
+            cursor = comment_end + 2
+            continue
+        char = text[cursor]
+        if char == "`":
+            template_end = javascript_template_literal_end(text, cursor)
+            if template_end is None:
+                return None
+            cursor = template_end
+            continue
+        if char in {'"', "'"}:
+            string_end = quoted_string_end(text, char, cursor)
+            if string_end is None:
+                return None
+            cursor = string_end
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            cursor += 1
+            continue
+        if char in ")]}":
+            if not stack or char != stack[-1]:
+                return None
+            stack.pop()
+            cursor += 1
+            if not stack:
+                return cursor
+            continue
+        cursor += 1
+    return None
+
+
+def javascript_template_interpolation_spans(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    cursor = start + 1
+    while cursor < end - 1:
+        if text[cursor] == "\\":
+            cursor += 2
+            continue
+        if not text.startswith("${", cursor):
+            cursor += 1
+            continue
+        interpolation_end = javascript_interpolation_end(text, cursor + 1)
+        if interpolation_end is None or interpolation_end > end:
+            return tuple(spans)
+        spans.append((cursor + 2, interpolation_end - 1))
+        cursor = interpolation_end
+    return tuple(spans)
+
+
+def strip_javascript_comments(
+    text: str,
+    *,
+    depth: int = 0,
+    maximum_depth: int = 8,
+) -> tuple[str, bool]:
+    pieces: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            line_end = JAVASCRIPT_LINE_TERMINATOR_PATTERN.search(
+                text,
+                cursor + 2,
+            )
+            if line_end is None:
+                break
+            pieces.append(line_end.group(0))
+            cursor = line_end.end()
+            continue
+        if text.startswith("/*", cursor):
+            comment_end = text.find("*/", cursor + 2)
+            if comment_end < 0:
+                return "".join(pieces), True
+            pieces.append(" ")
+            cursor = comment_end + 2
+            continue
+        char = text[cursor]
+        if char in {'"', "'"}:
+            string_end = quoted_string_end(text, char, cursor)
+            if string_end is None:
+                return "".join(pieces), True
+            pieces.append(text[cursor:string_end])
+            cursor = string_end
+            continue
+        if char == "`":
+            template_end = javascript_template_literal_end(text, cursor)
+            if template_end is None:
+                return "".join(pieces), True
+            spans = javascript_template_interpolation_spans(
+                text,
+                cursor,
+                template_end,
+            )
+            if spans and depth >= maximum_depth:
+                return "".join(pieces), True
+            segment_start = cursor
+            for interpolation_start, interpolation_end in spans:
+                pieces.append(text[segment_start:interpolation_start])
+                cleaned, invalid = strip_javascript_comments(
+                    text[interpolation_start:interpolation_end],
+                    depth=depth + 1,
+                    maximum_depth=maximum_depth,
+                )
+                if invalid:
+                    return "".join(pieces), True
+                pieces.append(cleaned)
+                segment_start = interpolation_end
+            pieces.append(text[segment_start:template_end])
+            cursor = template_end
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            pieces.append(text[cursor:regex_end])
+            cursor = regex_end
+            continue
+        pieces.append(char)
+        cursor += 1
+    return "".join(pieces), False
+
+
+def javascript_compound_assignment_spans(
+    text: str,
+    *,
+    offset: int = 0,
+    depth: int = 0,
+    maximum_depth: int = 8,
+    ambiguous_initial_state: bool = False,
+) -> tuple[tuple[int, int, int], ...]:
+    spans: list[tuple[int, int, int]] = []
+    if ambiguous_initial_state and depth < maximum_depth:
+        def append_suffix_spans(suffix_start: int) -> None:
+            spans.extend(
+                javascript_compound_assignment_spans(
+                    text[suffix_start:],
+                    offset=offset + suffix_start,
+                    depth=depth + 1,
+                    maximum_depth=maximum_depth,
+                )
+            )
+
+        partial_cursor = 0
+        while partial_cursor < len(text):
+            if text[partial_cursor] == "\\":
+                partial_cursor += 2
+                continue
+            if text.startswith("${", partial_cursor):
+                interpolation_end = javascript_interpolation_end(
+                    text,
+                    partial_cursor + 1,
+                )
+                if interpolation_end is None:
+                    break
+                interpolation_start = partial_cursor + 2
+                spans.extend(
+                    javascript_compound_assignment_spans(
+                        text[interpolation_start : interpolation_end - 1],
+                        offset=offset + interpolation_start,
+                        depth=depth + 1,
+                        maximum_depth=maximum_depth,
+                    )
+                )
+                partial_cursor = interpolation_end
+                continue
+            if text[partial_cursor] == "`":
+                append_suffix_spans(partial_cursor + 1)
+                break
+            partial_cursor += 1
+        for inherited_quote in ('"', "'"):
+            inherited_end = quoted_string_end(text, inherited_quote, -1)
+            if inherited_end is not None:
+                append_suffix_spans(inherited_end)
+        comment_end = text.find("*/")
+        if comment_end >= 0:
+            append_suffix_spans(comment_end + 2)
+        line_end = JAVASCRIPT_LINE_TERMINATOR_PATTERN.search(text)
+        if line_end is not None:
+            append_suffix_spans(line_end.end())
+    cursor = 0
+    line_start = 0
+    previous_code_line_start = 0
+    line_has_code = False
+    delimiter_stack: list[tuple[str, int]] = []
+    last_closed_start: int | None = None
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            line_end = JAVASCRIPT_LINE_TERMINATOR_PATTERN.search(
+                text,
+                cursor + 2,
+            )
+            if line_end is None:
+                cursor = len(text)
+                continue
+            if line_has_code:
+                previous_code_line_start = line_start
+            cursor = line_end.end()
+            line_start = cursor
+            line_has_code = False
+            continue
+        if text.startswith("/*", cursor):
+            comment_end = text.find("*/", cursor + 2)
+            comment_end = len(text) if comment_end < 0 else comment_end + 2
+            terminators = tuple(
+                JAVASCRIPT_LINE_TERMINATOR_PATTERN.finditer(
+                    text,
+                    cursor,
+                    comment_end,
+                )
+            )
+            if terminators:
+                if line_has_code:
+                    previous_code_line_start = line_start
+                line_start = terminators[-1].end()
+                line_has_code = False
+            cursor = comment_end
+            continue
+        char = text[cursor]
+        if char in {'"', "'"}:
+            string_end = quoted_string_end(text, char, cursor)
+            line_has_code = True
+            last_closed_start = None
+            cursor = len(text) if string_end is None else string_end
+            continue
+        if char == "`":
+            template_end = javascript_template_literal_end(text, cursor)
+            if template_end is None:
+                break
+            line_has_code = True
+            last_closed_start = None
+            if depth < maximum_depth:
+                for interpolation_start, interpolation_end in (
+                    javascript_template_interpolation_spans(
+                        text,
+                        cursor,
+                        template_end,
+                    )
+                ):
+                    spans.extend(
+                        javascript_compound_assignment_spans(
+                            text[interpolation_start:interpolation_end],
+                            offset=offset + interpolation_start,
+                            depth=depth + 1,
+                            maximum_depth=maximum_depth,
+                        )
+                    )
+            cursor = template_end
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            line_has_code = True
+            last_closed_start = None
+            cursor = regex_end
+            continue
+        operator = JAVASCRIPT_COMPOUND_ASSIGNMENT_PATTERN.match(text, cursor)
+        if operator is not None:
+            candidate_start = (
+                last_closed_start
+                if last_closed_start is not None
+                else (
+                    line_start if line_has_code else previous_code_line_start
+                )
+            )
+            spans.append(
+                (
+                    offset + candidate_start,
+                    offset + operator.start(),
+                    offset + operator.end(),
+                )
+            )
+            line_has_code = True
+            last_closed_start = None
+            cursor = operator.end()
+            continue
+        if char in "([":
+            delimiter_stack.append((")" if char == "(" else "]", cursor))
+            line_has_code = True
+            last_closed_start = None
+        elif char in ")]":
+            if delimiter_stack and delimiter_stack[-1][0] == char:
+                _closer, last_closed_start = delimiter_stack.pop()
+            else:
+                delimiter_stack.clear()
+                last_closed_start = None
+            line_has_code = True
+        elif char in ";{}":
+            line_start = cursor + 1
+            previous_code_line_start = line_start
+            line_has_code = False
+            delimiter_stack.clear()
+            last_closed_start = None
+        elif char in "\r\n":
+            if line_has_code:
+                previous_code_line_start = line_start
+            line_start = cursor + 1
+            line_has_code = False
+        elif not char.isspace():
+            line_has_code = True
+            if char != "!":
+                last_closed_start = None
+        cursor += 1
+    return tuple(spans)
+
+
+def computed_assignment_expressions(
+    text: str,
+    *,
+    maximum_length: int = 4096,
+    template_depth: int = 0,
+    maximum_template_depth: int = 8,
+    ambiguous_initial_state: bool = False,
+    fail_closed_incomplete_brackets: bool = False,
+) -> tuple[tuple[int, int, bool], ...]:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack: list[tuple[str, int]] = []
+    expressions: list[tuple[int, int, bool]] = []
+    if ambiguous_initial_state:
+        def append_suffix_expressions(suffix_start: int) -> None:
+            if template_depth >= maximum_template_depth:
+                expressions.append((suffix_start, suffix_start, True))
+                return
+            for start, end, overflow in computed_assignment_expressions(
+                text[suffix_start:],
+                maximum_length=maximum_length,
+                template_depth=template_depth + 1,
+                maximum_template_depth=maximum_template_depth,
+                fail_closed_incomplete_brackets=fail_closed_incomplete_brackets,
+            ):
+                expressions.append(
+                    (suffix_start + start, suffix_start + end, overflow)
+                )
+
+        partial_cursor = 0
+        while partial_cursor < len(text):
+            if text[partial_cursor] == "\\":
+                partial_cursor += 2
+                continue
+            if text.startswith("${", partial_cursor):
+                interpolation_end = javascript_interpolation_end(
+                    text,
+                    partial_cursor + 1,
+                )
+                if (
+                    interpolation_end is None
+                    or template_depth >= maximum_template_depth
+                ):
+                    expressions.append((partial_cursor, partial_cursor, True))
+                    break
+                interpolation_start = partial_cursor + 2
+                interpolation = text[interpolation_start : interpolation_end - 1]
+                for start, end, overflow in computed_assignment_expressions(
+                    interpolation,
+                    maximum_length=maximum_length,
+                    template_depth=template_depth + 1,
+                    maximum_template_depth=maximum_template_depth,
+                    fail_closed_incomplete_brackets=fail_closed_incomplete_brackets,
+                ):
+                    expressions.append(
+                        (
+                            interpolation_start + start,
+                            interpolation_start + end,
+                            overflow,
+                        )
+                    )
+                partial_cursor = interpolation_end
+                continue
+            if text[partial_cursor] == "`":
+                append_suffix_expressions(partial_cursor + 1)
+                break
+            partial_cursor += 1
+        for inherited_quote in ('"', "'"):
+            inherited_end = quoted_string_end(
+                text,
+                inherited_quote,
+                -1,
+            )
+            if inherited_end is not None:
+                append_suffix_expressions(inherited_end)
+        comment_end = text.find("*/")
+        if comment_end >= 0:
+            append_suffix_expressions(comment_end + 2)
+        line_end = re.search(r"\r\n|[\r\n\u2028\u2029]", text)
+        if line_end is not None:
+            append_suffix_expressions(line_end.end())
+    cursor = 0
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            line_end = JAVASCRIPT_LINE_TERMINATOR_PATTERN.search(
+                text,
+                cursor + 2,
+            )
+            if fail_closed_incomplete_brackets and line_end is None and any(
+                closer == "]" for closer, _opener in stack
+            ):
+                expressions.append((cursor, cursor, True))
+            cursor = (
+                len(text)
+                if line_end is None
+                else line_end.end()
+            )
+            continue
+        if text.startswith("/*", cursor):
+            comment_end = text.find("*/", cursor + 2)
+            if fail_closed_incomplete_brackets and comment_end < 0 and any(
+                closer == "]" for closer, _opener in stack
+            ):
+                expressions.append((cursor, cursor, True))
+            cursor = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        char = text[cursor]
+        if char == "`":
+            template_end = javascript_template_literal_end(text, cursor)
+            if template_end is None:
+                if fail_closed_incomplete_brackets and any(
+                    closer == "]" for closer, _opener in stack
+                ):
+                    expressions.append((cursor, cursor, True))
+                cursor += 1
+                continue
+            if template_depth >= maximum_template_depth:
+                expressions.append((cursor, cursor, True))
+                cursor = template_end
+                continue
+            for interpolation_start, interpolation_end in (
+                javascript_template_interpolation_spans(
+                    text,
+                    cursor,
+                    template_end,
+                )
+            ):
+                interpolation = text[interpolation_start:interpolation_end]
+                for start, end, overflow in computed_assignment_expressions(
+                    interpolation,
+                    maximum_length=maximum_length,
+                    template_depth=template_depth + 1,
+                    maximum_template_depth=maximum_template_depth,
+                    fail_closed_incomplete_brackets=fail_closed_incomplete_brackets,
+                ):
+                    expressions.append(
+                        (
+                            interpolation_start + start,
+                            interpolation_start + end,
+                            overflow,
+                        )
+                    )
+            cursor = template_end
+            continue
+        if char in {'"', "'"}:
+            string_end = quoted_string_end(text, char, cursor)
+            if fail_closed_incomplete_brackets and string_end is None and any(
+                closer == "]" for closer, _opener in stack
+            ):
+                expressions.append((cursor, cursor, True))
+            cursor = len(text) if string_end is None else string_end
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
+        if char in pairs:
+            stack.append((pairs[char], cursor))
+            cursor += 1
+            continue
+        if char not in ")]}":
+            cursor += 1
+            continue
+        if not stack or char != stack[-1][0]:
+            if ambiguous_initial_state and char == "]":
+                bracket_end = cursor + 1
+                trivia = re.match(JS_KEY_TRIVIA_TEXT, text[bracket_end:])
+                assert trivia is not None
+                delimiter = bracket_end + trivia.end()
+                if text[delimiter : delimiter + 1] in {":", "="}:
+                    expressions.append((0, cursor, True))
+            stack.clear()
+            cursor += 1
+            continue
+        _closer, opener = stack.pop()
+        bracket_end = cursor + 1
+        cursor = bracket_end
+        if char != "]":
+            continue
+        trivia = re.match(JS_KEY_TRIVIA_TEXT, text[bracket_end:])
+        assert trivia is not None
+        delimiter = bracket_end + trivia.end()
+        if text[delimiter : delimiter + 1] in {":", "="}:
+            expression_start = opener + 1
+            expression_end = bracket_end - 1
+            expressions.append(
+                (
+                    expression_start,
+                    expression_end,
+                    expression_end - expression_start > maximum_length,
+                )
+            )
+    return tuple(expressions)
+
+
+def computed_credential_secret_expression_risk(
+    text: str,
+    *,
+    javascript_dialect: str | None,
+    partial_hunk: bool,
+) -> bool:
+    for start, end, overflow in computed_assignment_expressions(
+        text,
+        ambiguous_initial_state=partial_hunk,
+        fail_closed_incomplete_brackets=(
+            javascript_dialect in {"javascript", "typescript"}
+        ),
+    ):
+        if overflow:
+            return True
+        expression = text[start:end]
+        commentless_expression, invalid = strip_javascript_comments(expression)
+        if invalid:
+            return True
+        fragments = quoted_literal_fragments(commentless_expression)
+        decoded_fragments: list[str] = []
+        for _start, _end, _quote, value, _closed in fragments:
+            decoded, invalid = decode_identifier_escapes(value)
+            if invalid:
+                return True
+            decoded_fragments.append(decoded)
+        decoded_expression, invalid = decode_identifier_escapes(
+            commentless_expression,
+        )
+        if invalid:
+            return True
+        normalized_fragments = re.sub(
+            r"[^A-Za-z0-9_]+",
+            "",
+            "".join(decoded_fragments),
+        ).lower()
+        normalized_expression = re.sub(
+            r"[^A-Za-z0-9_]+",
+            "",
+            decoded_expression,
+        ).lower()
+        if (
+            CREDENTIAL_SECRET_FIELD in normalized_fragments
+            or CREDENTIAL_SECRET_FIELD in normalized_expression
+        ):
+            return True
+    return False
+
+
+def compound_credential_secret_assignment_risk(
+    text: str,
+    *,
+    javascript_dialect: str | None,
+    partial_hunk: bool,
+) -> bool:
+    if javascript_dialect not in {"javascript", "typescript"}:
+        return False
+    for lhs_start, operator_start, _operator_end in (
+        javascript_compound_assignment_spans(
+            text,
+            ambiguous_initial_state=partial_hunk,
+        )
+    ):
+        prefix, invalid = strip_javascript_comments(
+            text[lhs_start:operator_start],
+        )
+        if invalid:
+            return True
+        boundary = max(
+            (prefix.rfind(delimiter) for delimiter in ";{}"),
+            default=-1,
+        )
+        lhs = prefix[boundary + 1 :].strip()
+        if javascript_dialect == "typescript":
+            lhs = re.sub(r"!+(?=\s*(?:\)|$))", "", lhs)
+        if COMPOUND_CREDENTIAL_SECRET_LHS_PATTERN.search(lhs):
+            return True
+        simple_assignment = lhs.strip("() \t\r\n") + "="
+        if (
+            escaped_credential_secret_key_risk(simple_assignment)
+            or computed_credential_secret_expression_risk(
+                simple_assignment,
+                javascript_dialect=javascript_dialect,
+                partial_hunk=True,
+            )
+        ):
+            return True
+    return False
+
+
+def safe_mirrored_javascript_reference_suffix(
+    text: str,
+    end: int,
+    *,
+    partial_tail: bool = False,
+) -> bool:
+    trivia = re.match(JS_KEY_TRIVIA_TEXT, text[end:])
+    assert trivia is not None
+    cursor = end + trivia.end()
+    return (
+        cursor < len(text) and text[cursor] in ",;})]"
+    ) or (cursor >= len(text) and not partial_tail)
+
+
+def safe_short_credential_fixture_expression(
+    text: str,
+    *,
+    javascript_dialect: str | None,
+    partial_tail: bool = False,
+) -> bool:
+    if javascript_dialect not in {"javascript", "typescript"}:
+        return False
+    fixture = re.match(r"(?P<quote>[\"'])qa-app(?P=quote)", text)
+    return fixture is not None and safe_mirrored_javascript_reference_suffix(
+        text,
+        fixture.end(),
+        partial_tail=partial_tail,
+    )
+
+
+def safe_typescript_credential_schema(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None,
+    partial_tail: bool = False,
+) -> bool:
+    if (
+        javascript_dialect != "typescript"
+        or match.group("call_value") != "z.string"
+    ):
+        return False
+    suffix = re.match(
+        r"\(\)\.min\([ \t]*1[ \t]*\)",
+        text[match.end() :],
+    )
+    return suffix is not None and safe_mirrored_javascript_reference_suffix(
+        text,
+        match.end() + suffix.end(),
+        partial_tail=partial_tail,
+    )
+
+
+def safe_javascript_credential_name_call(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None,
+    partial_tail: bool = False,
+) -> bool:
+    if (
+        javascript_dialect not in {"javascript", "typescript"}
+        or match.group("call_value") != "vaultName"
+    ):
+        return False
+    suffix = re.match(
+        r"\([ \t]*(?:[A-Z][A-Z0-9_]*"
+        r"|(?P<quote>[\"'])qa-app(?P=quote))[ \t]*\)",
+        text[match.end() :],
+    )
+    return suffix is not None and safe_mirrored_javascript_reference_suffix(
+        text,
+        match.end() + suffix.end(),
+        partial_tail=partial_tail,
+    )
+
+
 def explicit_template_value(value: str) -> bool:
     if len(value) > 256:
         return False
@@ -4622,7 +5466,7 @@ def javascript_regex_literal_end(
         )
         if closes_control_condition:
             previous = -1
-    if previous >= 0 and text[previous] not in "([{:;,=!?&|+-*%^~<>":
+    if previous >= 0 and text[previous] not in "([{:;,=!?&|+-*%^~<>/":
         word_start = previous
         while word_start >= 0 and (
             text[word_start].isalnum() or text[word_start] in "_$"
@@ -5535,7 +6379,39 @@ def secret_text_risk(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    _partial_hunk: bool = False,
+    _partial_tail: bool = False,
 ) -> bool:
+    if DIFF_HUNK_CONTENT_BOUNDARY in text:
+        for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY):
+            partial_hunk = segment.startswith(DIFF_HUNK_PARTIAL_MARKER)
+            if partial_hunk:
+                segment = segment[len(DIFF_HUNK_PARTIAL_MARKER) :]
+            partial_tail = segment.startswith(DIFF_HUNK_PARTIAL_TAIL_MARKER)
+            if partial_tail:
+                segment = segment[len(DIFF_HUNK_PARTIAL_TAIL_MARKER) :]
+            if secret_text_risk(
+                segment,
+                javascript_dialect=javascript_dialect,
+                _partial_hunk=partial_hunk,
+                _partial_tail=partial_tail,
+            ):
+                return True
+        return False
+    if (
+        escaped_credential_secret_key_risk(text)
+        or compound_credential_secret_assignment_risk(
+            text,
+            javascript_dialect=javascript_dialect,
+            partial_hunk=_partial_hunk,
+        )
+        or computed_credential_secret_expression_risk(
+            text,
+            javascript_dialect=javascript_dialect,
+            partial_hunk=_partial_hunk,
+        )
+    ):
+        return True
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
@@ -5573,6 +6449,24 @@ def secret_text_risk(
         else frozenset()
     )
     for prefix in assignment_prefixes:
+        prefix_key = re.split(
+            r"\s*[:=]\s*",
+            prefix.group(0),
+            maxsplit=1,
+        )[0].strip("\"'").lower()
+        if (
+            prefix_key == CREDENTIAL_SECRET_FIELD
+            and prefix.start() not in assignment_match_starts
+            and prefix_contexts.get(prefix.start()) is None
+        ):
+            unmatched_value = text[prefix.end() :].lstrip()
+            if safe_short_credential_fixture_expression(
+                unmatched_value,
+                javascript_dialect=javascript_dialect,
+                partial_tail=_partial_tail,
+            ):
+                continue
+            return True
         if (
             prefix.start() not in assignment_match_starts
             and prefix_contexts.get(prefix.start()) is None
@@ -5680,6 +6574,33 @@ def secret_text_risk(
             )
         ):
             continue
+        if key.strip("\"'").lower() == CREDENTIAL_SECRET_FIELD:
+            if safe_typescript_credential_schema(
+                text,
+                match,
+                javascript_dialect=javascript_dialect,
+                partial_tail=_partial_tail,
+            ):
+                continue
+            if safe_javascript_credential_name_call(
+                text,
+                match,
+                javascript_dialect=javascript_dialect,
+                partial_tail=_partial_tail,
+            ):
+                continue
+            if (
+                javascript_dialect in {"javascript", "typescript"}
+                and match.group("reference_value") is not None
+                and mirrored_javascript_reference_assignment(key, value)
+                and safe_mirrored_javascript_reference_suffix(
+                    text,
+                    match.end(),
+                    partial_tail=_partial_tail,
+                )
+            ):
+                continue
+            return True
         if (
             match.group("bare_value") is not None
             and javascript_dialect is not None
@@ -5842,14 +6763,34 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
     for line in patch.splitlines():
         hunk_header = re.match(r"^(@{2,})", line)
         if hunk_header:
-            old_content.append(";")
-            new_content.append(";")
+            marker = hunk_header.group(1)
+            ranges_end = line.find(marker, len(marker))
+            ranges_text = (
+                line[len(marker) : ranges_end]
+                if ranges_end >= 0
+                else ""
+            )
+            ranges = re.findall(r"([+-])(\d+)(?:,\d+)?", ranges_text)
+            old_starts = [int(start) for kind, start in ranges if kind == "-"]
+            new_starts = [int(start) for kind, start in ranges if kind == "+"]
+            old_partial = not old_starts or any(start > 1 for start in old_starts)
+            new_partial = not new_starts or any(start > 1 for start in new_starts)
+            old_content.append(
+                DIFF_HUNK_CONTENT_BOUNDARY
+                + (DIFF_HUNK_PARTIAL_MARKER if old_partial else "")
+                + DIFF_HUNK_PARTIAL_TAIL_MARKER
+            )
+            new_content.append(
+                DIFF_HUNK_CONTENT_BOUNDARY
+                + (DIFF_HUNK_PARTIAL_MARKER if new_partial else "")
+                + DIFF_HUNK_PARTIAL_TAIL_MARKER
+            )
             in_hunk = True
             prefix_columns = len(hunk_header.group(1)) - 1
             continue
         if line.startswith("diff --"):
-            old_content.append(";")
-            new_content.append(";")
+            old_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
+            new_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
             in_hunk = False
             continue
         prefix = line[:prefix_columns]

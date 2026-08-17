@@ -2145,6 +2145,557 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     )
                 )
 
+    def test_secret_detector_allows_only_mirrored_cred_secret_references(
+        self,
+    ) -> None:
+        key = "cred_" + "secret"
+        for content in (
+            f"{key}: configuredAuth.{key}",
+            f"{key}: runtime.config.{key}",
+            f"{key}: configuredAuth.{key}\n}}",
+            f"{key}: configuredAuth.{key}\n,",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        mirror = f"{key}: configuredAuth.{key}"
+        for unsupported_dialect in (None, "python", "json"):
+            with self.subTest(unsupported_dialect=unsupported_dialect):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        mirror,
+                        javascript_dialect=unsupported_dialect,
+                    )
+                )
+        for compound_assignment in (
+            f'{key} ??= "CorrectHorse' + 'BatteryStaple"',
+            f'state.{key} ||= "CorrectHorse' + 'BatteryStaple"',
+            f'config["{key}"] += "CorrectHorse' + 'BatteryStaple"',
+            f'{key} &&= configuredAuth.{key}',
+            f'condition && ({key} ??= configuredAuth.{key})',
+            f'if (condition) {key} ||= configuredAuth.{key}',
+            f'const f = () => {key} ??= configuredAuth.{key}',
+            f'({key}) ??= "CorrectHorse' + 'BatteryStaple"',
+            f'(state.{key}) ||= "CorrectHorse' + 'BatteryStaple"',
+            f'{key}\n??= "CorrectHorse' + 'BatteryStaple"',
+            f'state.{key}\n||= "CorrectHorse' + 'BatteryStaple"',
+            f'({key}) /* gap */\n+= "CorrectHorse' + 'BatteryStaple"',
+            f'(\n  {key}\n)\n??= "CorrectHorse' + 'BatteryStaple"',
+            f'((\n  state.{key}\n))\n||= "CorrectHorse' + 'BatteryStaple"',
+            f'{key}! ??= "CorrectHorse' + 'BatteryStaple"',
+            f'{key}!! ??= "CorrectHorse' + 'BatteryStaple"',
+            f'({key})! ||= "CorrectHorse' + 'BatteryStaple"',
+            f'state.{key}! &&= "CorrectHorse' + 'BatteryStaple"',
+            f'config["{key}"]! ??= "CorrectHorse' + 'BatteryStaple"',
+            f'{key}' + " " * 9000 + '??= "CorrectHorse' + 'BatteryStaple"',
+            f'{key}/*' + "x" * 9000 + '*/??= "CorrectHorse' + 'BatteryStaple"',
+        ):
+            with self.subTest(compound_assignment=compound_assignment):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        compound_assignment,
+                        javascript_dialect="typescript",
+                    )
+                )
+        for unrelated_compound in (
+            f'count += 1; {key} = configuredAuth.{key}',
+            f'const doc = "{key} ??= example";',
+            f'// {key} += example',
+            f'const pattern = /{key}\\s*\\+=/;',
+        ):
+            with self.subTest(unrelated_compound=unrelated_compound):
+                self.assertFalse(
+                    self.helper["compound_credential_secret_assignment_risk"](
+                        unrelated_compound,
+                        javascript_dialect="javascript",
+                        partial_hunk=False,
+                    )
+                )
+        for inherited_compound_prefix in (
+            "remaining raw`; ",
+            'remaining"; ',
+            "remaining'; ",
+            "remaining raw // text`; ",
+        ):
+            with self.subTest(
+                inherited_compound_prefix=inherited_compound_prefix,
+            ):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        inherited_compound_prefix
+                        + f'{key} ??= "CorrectHorse'
+                        + 'BatteryStaple";',
+                        javascript_dialect="typescript",
+                        _partial_hunk=True,
+                    )
+                )
+        truncated_mirror_patch = (
+            "diff --git a/src/partial.ts b/src/partial.ts\n"
+            "--- a/src/partial.ts\n"
+            "+++ b/src/partial.ts\n"
+            "@@ -100 +100 @@\n"
+            f"+{mirror}\n"
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "partial mirror tail",
+                ["src/partial.ts"],
+                truncated_mirror_patch,
+            )
+
+        schema = f"{key}: z.string().min(1)"
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                schema,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](schema))
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                schema + '\n + "hunter' + '2"',
+                javascript_dialect="typescript",
+            )
+        )
+        for content in (
+            schema + "()",
+            schema + "``",
+            schema + ".optional()",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+        vault_reference = f"{key}: vaultName(QA_VAULT_EMPRESAS)"
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                vault_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](vault_reference))
+        fixture_vault_reference = f'{key}: vaultName("qa-app")'
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                fixture_vault_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                vault_reference + '\n + "hunter' + '2"',
+                javascript_dialect="typescript",
+            )
+        )
+        for content in (
+            vault_reference + "()",
+            vault_reference + " /* gap */ ()",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+        short_fixture = f'{key}: "qa-app"'
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                short_fixture,
+                javascript_dialect="typescript",
+            )
+        )
+
+        for content in (
+            f'{key}: "sk-live-' + 'abc123"',
+            f"{key}: obtenerSecreto()",
+            f"{key}: configuredAuth.other_field",
+            f'{key}: z.string().default("sk-live-' + 'abc123")',
+            f'{key}: vaultName("sk-live-' + 'abc123")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+        for content in (
+            f"{key}: (obtenerSecreto())",
+            f"{key}: (configuredAuth.other_field)",
+            f"{key}: (configuredAuth?.{key})",
+            f'{key}: (configuredAuth["{key}"])',
+            mirror + "\n()",
+            mirror + " /* gap */ ()",
+            mirror + "``",
+            f"{key}: _configuredAuth.{key}",
+            f"{key}: $configuredAuth.{key}",
+            f"{key}: $.{key}",
+            f"{key}: await obtenerSecreto()",
+            f"{key}: yield obtenerSecreto()",
+            f"{key}: [configuredAuth.other_field][0]",
+            f"{key}: {{value: configuredAuth.other_field}}.value",
+            f"{key}: <string>configuredAuth.other_field",
+            f"{key}: obtener\\u0053ecreto()",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+        escaped_key = '"cred_' + r"\u0073" + 'ecret"'
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                escaped_key + ': "CorrectHorse' + 'BatteryStaple"',
+                javascript_dialect="typescript",
+            )
+        )
+        bare_escaped_key = "cred_" + r"\u0073" + "ecret"
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                bare_escaped_key + ': "CorrectHorse' + 'BatteryStaple"',
+                javascript_dialect="typescript",
+            )
+        )
+        invalid_escaped_key = '"x' + r"\u{FFFFFF}" + '"'
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                invalid_escaped_key + ": value",
+                javascript_dialect="typescript",
+            )
+        )
+        computed_keys = (
+            '["' + key + '"]',
+            "['" + key + "']",
+            "[`" + key + "`]",
+            '["cred_' + r"\u0073" + 'ecret"]',
+            r"\u0063" + "red_" + r"\u0073" + "ecret",
+        )
+        for computed_key in computed_keys:
+            content = computed_key + ': "CorrectHorse' + 'BatteryStaple"'
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        computed_concat_key = '["' + key[:5] + '" + "' + key[5:] + '"]'
+        for compound_computed_key in (
+            "config" + computed_concat_key,
+            'config["cred_' + r"\u0073" + 'ecret"]',
+        ):
+            with self.subTest(compound_computed_key=compound_computed_key):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        compound_computed_key
+                        + ' ??= "CorrectHorse'
+                        + 'BatteryStaple"',
+                        javascript_dialect="typescript",
+                    )
+                )
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        compound_computed_key
+                        + '! ??= "CorrectHorse'
+                        + 'BatteryStaple"',
+                        javascript_dialect="typescript",
+                    )
+                )
+        computed_expressions = (
+            computed_concat_key,
+            "[`" + key[:5] + '${"' + key[5:] + '"}`]',
+            '["' + key[:5] + '".concat("' + key[5:] + '")]',
+            '["' + key[:5] + '" + /*' + "x" * 520 + '*/ "' + key[5:] + '"]',
+            '["' + key[:5] + '" + /*' + "x" * 4200 + '*/ "' + key[5:] + '"]',
+            '["' + key[:5] + '" + /* x */ ' + key[5:] + ']',
+            '["' + key[:5] + '" + // x\n' + key[5:] + ']',
+            '["/*".slice(2) + "' + key[:5] + '" + ' + key[5:] + ']',
+            '["//".slice(2) + "' + key[:5] + '" + ' + key[5:] + ']',
+            '["' + key[:5] + '" + "' + key[5:] + '" /* unterminated ]',
+            '["' + key[:5] + '" + ["' + key[5:] + '"][0]]',
+            '["' + key[:5] + '" + "\\u0073' + key[6:] + '"]',
+            '["' + key[:5] + '" + "\\x73' + key[6:] + '"]',
+            '["' + key[:5] + '" + "\\163' + key[6:] + '"]',
+        )
+        for computed_key in computed_expressions:
+            content = computed_key + ': "CorrectHorse' + 'BatteryStaple"'
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        regex_prefix_key = (
+            '(await /\\/\\//, "'
+            + key[:5]
+            + '" + "'
+            + key[5:]
+            + '")'
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'async function f() {{ return {{[{regex_prefix_key}]: "CorrectHorse'
+                + 'BatteryStaple"}; }',
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "var await = 10, total = 2, count = 3; const x = {"
+                + f'[(await / total, {computed_concat_key})]: "CorrectHorse'
+                + 'BatteryStaple" / count};',
+                javascript_dialect="javascript",
+            )
+        )
+        for safe_contextual_slash in (
+            "async function f(){ return await /abc/; }",
+            "async function f(){ return (await /abc/); }",
+            "const ratio = (await / total);",
+            "function* f(){ return (yield /abc/); }",
+            "function f() {\n  // trailing comment",
+            "async function f(){ return ok ? [await /abc/] : []; }",
+            "async function f(){ return ok ? [await / total] : []; }",
+            "const x = {[(await /abc/, fieldName)]: 1};",
+        ):
+            with self.subTest(safe_contextual_slash=safe_contextual_slash):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        safe_contextual_slash,
+                        javascript_dialect="javascript",
+                    )
+                )
+        division_regex_key = (
+            '(0 / /\\/\\//.source, "'
+            + key[:5]
+            + '" + "'
+            + key[5:]
+            + '")'
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'const x = {{[{division_regex_key}]: "CorrectHorse'
+                + 'BatteryStaple"};',
+                javascript_dialect="typescript",
+            )
+        )
+        safe_comment_expression = (
+            '[foo/* "'
+            + key[:5]
+            + '" + "'
+            + key[5:]
+            + '" */ + bar]: 1'
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                safe_comment_expression,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f'const rows = [{{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" }];',
+                javascript_dialect="typescript",
+            )
+        )
+        for prefix in ("", "tag"):
+            content = (
+                f'const rendered = {prefix}`${{({{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" })}`;'
+            )
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        deep_template = "`" + "${`" * 66 + "x" + "`}" * 66 + "`"
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "const rendered = "
+                + deep_template
+                + f'; const leaked = {{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" };',
+                javascript_dialect="typescript",
+            )
+        )
+        orphan_closer = (
+            f'remaining template text`;\nconst leaked = {{ {computed_concat_key}: "CorrectHorse'
+            + 'BatteryStaple" };'
+            + self.helper["DIFF_HUNK_CONTENT_BOUNDARY"]
+            + "const label = `ok`;"
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                orphan_closer,
+                javascript_dialect="typescript",
+            )
+        )
+        partial_hunk_patch = (
+            "diff --git a/src/partial.ts b/src/partial.ts\n"
+            "--- a/src/partial.ts\n"
+            "+++ b/src/partial.ts\n"
+            "@@ -100,3 +100,3 @@\n"
+            "+remaining template text`;\n"
+            f'+const leaked = {{ {computed_concat_key}: "CorrectHorse'
+            + 'BatteryStaple" };\n'
+            "+const label = `ok`;\n"
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "partial template hunk",
+                ["src/partial.ts"],
+                partial_hunk_patch,
+            )
+        for raw_prefix in ("remaining // raw text", "remaining /* raw text"):
+            comment_patch = (
+                "diff --git a/src/partial.ts b/src/partial.ts\n"
+                "--- a/src/partial.ts\n"
+                "+++ b/src/partial.ts\n"
+                "@@ -100 +100 @@\n"
+                f'+{raw_prefix}`; const leaked = {{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" };\n'
+            )
+            with self.subTest(raw_prefix=raw_prefix), self.assertRaisesRegex(
+                SystemExit,
+                "secret-like content",
+            ):
+                self.helper["validate_review_patch"](
+                    "partial template comment hunk",
+                    ["src/partial.ts"],
+                    comment_patch,
+                )
+        full_file_template_patch = (
+            "diff --git a/src/full.ts b/src/full.ts\n"
+            "--- a/src/full.ts\n"
+            "+++ b/src/full.ts\n"
+            "@@ -1 +1 @@ function f(x+2)\n"
+            f'+const doc = `raw {{ {computed_concat_key}: "CorrectHorse'
+            + 'BatteryStaple" }`;\n'
+        )
+        self.helper["validate_review_patch"](
+            "full template hunk with range-like context",
+            ["src/full.ts"],
+            full_file_template_patch,
+        )
+        alternating_templates_patch = (
+            "diff --git a/src/partial.ts b/src/partial.ts\n"
+            "--- a/src/partial.ts\n"
+            "+++ b/src/partial.ts\n"
+            "@@ -100 +100 @@\n"
+            "+remaining inherited template`; const safe = `ok`; "
+            f'const leaked = {{ {computed_concat_key}: "CorrectHorse'
+            + 'BatteryStaple" }; const tail = `ok`;\n'
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "partial hunk with alternating templates",
+                ["src/partial.ts"],
+                alternating_templates_patch,
+            )
+        partial_computed_key_patch = (
+            "diff --git a/src/partial.ts b/src/partial.ts\n"
+            "--- a/src/partial.ts\n"
+            "+++ b/src/partial.ts\n"
+            "@@ -100 +100 @@\n"
+            f'+"{key[5:]}"]: "CorrectHorse' + 'BatteryStaple";\n'
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "partial computed key",
+                ["src/partial.ts"],
+                partial_computed_key_patch,
+            )
+        for inherited_prefix in (
+            'continued"; ',
+            "continued'; ",
+            'raw " text\n+*/ ',
+        ):
+            inherited_context_patch = (
+                "diff --git a/src/partial.ts b/src/partial.ts\n"
+                "--- a/src/partial.ts\n"
+                "+++ b/src/partial.ts\n"
+                "@@ -100,2 +100,2 @@\n"
+                f'+{inherited_prefix}const leaked = {{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" }; const tail = "ok";\n'
+            )
+            with self.subTest(
+                inherited_prefix=inherited_prefix,
+            ), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_review_patch"](
+                    "partial hunk inherited lexical context",
+                    ["src/partial.ts"],
+                    inherited_context_patch,
+                )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                f'const doc = `; raw {{ {computed_concat_key}: "CorrectHorse'
+                + 'BatteryStaple" }`;',
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                '[fieldName]: "CorrectHorse' + 'BatteryStaple"',
+                javascript_dialect="typescript",
+            )
+        )
+        commented_keys = (
+            key + " /* gap */",
+            '"' + key + '" /* gap */',
+            '[/* gap */ "' + key + '"]',
+            '["' + key + '"] /* gap */',
+        )
+        for commented_key in commented_keys:
+            content = commented_key + ': "CorrectHorse' + 'BatteryStaple"'
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+        lf_continuation = "\\\n"
+        crlf_continuation = "\\\r\n"
+        continued_keys = (
+            '"cred_' + lf_continuation + 'secret"',
+            "'cred_" + lf_continuation + "secret'",
+            '"cred_' + crlf_continuation + 'secret"',
+            "[`cred_" + lf_continuation + "secret`]",
+            "cred_" + lf_continuation + "secret",
+        )
+        for continued_key in continued_keys:
+            content = continued_key + ': "CorrectHorse' + 'BatteryStaple"'
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                f"{key}: configuredAuth.{key}",
+            )
+        )
+
     def test_secret_detector_allows_qa_resolver_calls_without_literals(
         self,
     ) -> None:
