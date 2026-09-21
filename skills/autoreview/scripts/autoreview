@@ -2451,7 +2451,62 @@ def git_bytes(
     repo: Path,
     *args: str,
     check: bool = True,
+    max_output_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if max_output_bytes is not None:
+        # H1 only. Legacy callers retain the subprocess behavior below.
+        if max_output_bytes < 0:
+            raise ValueError("negative Git output bound")
+        command = [resolve_command("git", repo), "--no-optional-locks",
+                   "--no-replace-objects", *SAFE_GIT_CONFIG_ARGS, *args]
+        # The existing Windows cleanup cannot guarantee ownership of children
+        # that outlive their leader. Keep H1 fail-closed on that platform.
+        if os.name == "nt":
+            result = subprocess.CompletedProcess(command, 126, b"", b"")
+        else:
+            env = safe_git_env(repo)
+            env.update({"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "",
+                        "GIT_PROTOCOL_FROM_USER": "0"})
+            proc = subprocess.Popen(
+                command, cwd=repo, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                **process_group_popen_kwargs(),
+            )
+            register_owned_process(proc)
+            timed_out = threading.Event()
+
+            def expire() -> None:
+                timed_out.set()
+                terminate_process_group(proc, grace_seconds=0.1)
+
+            timer = threading.Timer(5.0, expire)
+            timer.daemon = True
+            timer.start()
+            try:
+                assert proc.stdout is not None
+                output = proc.stdout.read(max_output_bytes + 1)
+                exceeded = len(output) > max_output_bytes
+                if exceeded:
+                    terminate_process_group(proc, grace_seconds=0.1)
+                code = proc.wait()
+                timer.cancel()
+                timer.join()
+                failed = exceeded or timed_out.is_set()
+                result = subprocess.CompletedProcess(
+                    command, 124 if failed else code, b"" if failed else output, b"",
+                )
+            finally:
+                timer.cancel()
+                timer.join()
+                if proc.poll() is None:
+                    terminate_process_group(proc, grace_seconds=0.1)
+                proc.wait()
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                unregister_owned_process(proc)
+        if check and result.returncode:
+            raise SystemExit("refusing unavailable or unbounded Git context")
+        return result
     result = subprocess.run(
         [
             resolve_command("git", repo),
@@ -9811,6 +9866,205 @@ def diff_section_without_deleted_line_contents(section: str) -> str:
     return "".join(retained)
 
 
+def speculative_partial_sentinel_only(text: str, dialect: str) -> bool:
+    """Qualify only unknown-start overflow; never reinterpret other findings."""
+    if len(text.encode("utf-8")) > MAX_BUNDLE_TEXT_BYTES or text.count("\n") > 20_000:
+        return False
+    found = False
+    for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY):
+        partial = segment.startswith(DIFF_HUNK_PARTIAL_MARKER)
+        if partial:
+            segment = segment[len(DIFF_HUNK_PARTIAL_MARKER):]
+        tail = segment.startswith(DIFF_HUNK_PARTIAL_TAIL_MARKER)
+        if tail:
+            segment = segment[len(DIFF_HUNK_PARTIAL_TAIL_MARKER):]
+        if not secret_text_risk(
+            segment, javascript_dialect=dialect,
+            _partial_hunk=partial, _partial_tail=tail,
+        ):
+            continue
+        if (
+            not partial
+            or secret_text_risk(
+                segment, javascript_dialect=dialect, _partial_tail=tail,
+            )
+            or compound_credential_secret_assignment_risk(
+                segment, javascript_dialect=dialect, partial_hunk=True,
+            )
+        ):
+            return False
+        actual = set(computed_assignment_expressions(
+            segment, fail_closed_incomplete_brackets=True,
+        ))
+        speculative = computed_assignment_expressions(
+            segment, ambiguous_initial_state=True,
+            fail_closed_incomplete_brackets=True,
+        )
+        if not any(overflow for _, _, overflow in speculative):
+            return False
+        # Even a clean full-file scan cannot waive a non-overflow speculative
+        # expression. Only already-scanned actual expressions may coexist.
+        if any(not item[2] and item not in actual for item in speculative):
+            return False
+        found = True
+    return found
+
+
+def exact_git_hunks_match(lines: list[bytes], before: bytes, after: bytes) -> bool:
+    """Check every hunk and every unchanged byte, including EOF/CRLF bytes."""
+    def lf_lines(data: bytes) -> list[bytes]:
+        parts = data.split(b"\n")
+        return [part + b"\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+    old_lines, new_lines = lf_lines(before), lf_lines(after)
+    if max(len(old_lines), len(new_lines), len(lines)) > 20_000:
+        return False
+    old_cursor = new_cursor = cursor = 0
+    hunks = 0
+    while cursor < len(lines):
+        header = re.fullmatch(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n", lines[cursor])
+        if header is None:
+            return False
+        old_start, old_count, new_start, new_count = (
+            int(value) if value is not None else 1 for value in header.groups()
+        )
+        old_start -= bool(old_count)
+        new_start -= bool(new_count)
+        if (
+            old_start < old_cursor or new_start < new_cursor
+            or old_start + old_count > len(old_lines)
+            or new_start + new_count > len(new_lines)
+            or old_lines[old_cursor:old_start] != new_lines[new_cursor:new_start]
+        ):
+            return False
+        old_hunk: list[bytes] = []
+        new_hunk: list[bytes] = []
+        cursor += 1
+        previous = b""
+        while cursor < len(lines) and not lines[cursor].startswith(b"@@ "):
+            line = lines[cursor]
+            cursor += 1
+            if line == b"\\ No newline at end of file\n":
+                if previous not in (b" ", b"-", b"+"):
+                    return False
+                if previous != b"+":
+                    old_hunk[-1] = old_hunk[-1][:-1]
+                if previous != b"-":
+                    new_hunk[-1] = new_hunk[-1][:-1]
+                previous = b""
+                continue
+            previous = line[:1]
+            if previous not in (b" ", b"-", b"+") or not line.endswith(b"\n"):
+                return False
+            if previous != b"+":
+                old_hunk.append(line[1:])
+            if previous != b"-":
+                new_hunk.append(line[1:])
+        if (
+            len(old_hunk) != old_count or len(new_hunk) != new_count
+            or old_hunk != old_lines[old_start:old_start + old_count]
+            or new_hunk != new_lines[new_start:new_start + new_count]
+        ):
+            return False
+        old_cursor, new_cursor = old_start + old_count, new_start + new_count
+        hunks += 1
+    return bool(hunks) and old_lines[old_cursor:] == new_lines[new_cursor:]
+
+
+def verified_git_diff_context(
+    context: tuple[Path, str, str], section: str, path: str, budget: list[int],
+) -> tuple[str, str] | None:
+    """Read bounded immutable blobs bound to the original branch patch/trees."""
+    if budget[1] <= 0 or len(section.encode("utf-8")) > MAX_BUNDLE_TEXT_BYTES:
+        return None
+    budget[1] -= 1
+    repo, base_ref, head_ref = context
+    lines = [line.encode("utf-8") for line in literal_lf_lines(section)]
+    if (
+        len(lines) < 5 or len(lines) > 20_000
+        or not lines[2].startswith(b"--- ") or not lines[3].startswith(b"+++ ")
+        or lines[0] != b"diff --git " + lines[2][4:-1] + b" " + lines[3][4:]
+        or diff_section_paths(section) != (path, path)
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or "\0" in path
+    ):
+        return None
+    index = re.fullmatch(rb"index ([0-9a-f]{4,64})\.\.([0-9a-f]{4,64}) (100644|100755)\n", lines[1])
+    if index is None:
+        return None
+
+    def read(*args: str, limit: int = 4096) -> bytes:
+        result = git_bytes(
+            repo, "--literal-pathspecs",
+            *args, check=False, max_output_bytes=limit,
+        )
+        if result.returncode or len(result.stdout) > limit:
+            raise ValueError("unavailable context")
+        return result.stdout
+
+    def object_id(data: bytes) -> str:
+        value = data.decode("ascii").strip()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError("invalid object identity")
+        return value
+
+    try:
+        config = git_bytes(
+            repo, "config", "--includes", "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+            check=False, max_output_bytes=4096,
+        )
+        # Exit 1 with empty output is Git's documented 'no matching key'.
+        # Every present value (even false), error, timeout or cap is refusal.
+        if config.returncode != 1 or config.stdout:
+            return None
+        base = object_id(read("rev-parse", "--verify", "--end-of-options", base_ref + "^{commit}"))
+        head = object_id(read("rev-parse", "--verify", "--end-of-options", head_ref + "^{commit}"))
+        before_tree = object_id(read("merge-base", base, head))
+        contents: list[bytes] = []
+        for tree, abbreviated in zip((before_tree, head), index.groups()[:2]):
+            entry = read("ls-tree", "-z", "--full-tree", tree, "--", path)
+            match = re.fullmatch(rb"(100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t([^\0]+)\0", entry)
+            if (
+                match is None or match[1] != index[3]
+                or match[3] != path.encode("utf-8") or not match[2].startswith(abbreviated)
+            ):
+                return None
+            oid = match[2].decode("ascii")
+            # Resolve the abbreviation as well: colliding prefixes do not prove
+            # the identity claimed by the index line, even with a matching path.
+            if object_id(read("rev-parse", "--verify", "--end-of-options", abbreviated.decode("ascii") + "^{blob}")) != oid:
+                return None
+            raw_size = read("cat-file", "-s", oid, limit=32)
+            if re.fullmatch(rb"[0-9]+\n", raw_size) is None:
+                return None
+            size = int(raw_size)
+            if size > MAX_BUNDLE_TEXT_BYTES or size > budget[0]:
+                return None
+            budget[0] -= size
+            content = read("cat-file", "blob", oid, limit=size)
+            if len(content) != size or b"\0" in content or content.count(b"\n") > 20_000:
+                return None
+            digest = hashlib.sha1 if len(oid) == 40 else hashlib.sha256
+            if digest(b"blob " + str(size).encode("ascii") + b"\0" + content).hexdigest() != oid:
+                return None
+            contents.append(content)
+        if not exact_git_hunks_match(lines[4:], *contents):
+            return None
+        before, after = (content.decode("utf-8", errors="strict") for content in contents)
+        dialect = javascript_review_dialect(path)
+        if any(
+            secret_text_risk(content, javascript_dialect=dialect)
+            or review_credential_secret_shape_risk(content, javascript_dialect=dialect)
+            for content in (before, after)
+        ):
+            return None
+        return before, after
+    except (OSError, ValueError, SystemExit, subprocess.SubprocessError):
+        # Evidence failure preserves the original partial-input refusal.
+        return None
+
+
 def redact_deletion_only_secret_values(
     label: str,
     patch: str,
@@ -9819,10 +10073,12 @@ def redact_deletion_only_secret_values(
     mixed_deletion_paths: set[str],
     additional_secret_context: str,
     known_secret_fragments_out: set[str] | None,
+    git_context: tuple[Path, str, str] | None = None,
 ) -> str:
     units = review_bundle_units(patch)
     deletion_sections: dict[int, tuple[str | None, str, set[str]]] = {}
     all_fragments: set[str] = set()
+    context_budget = [MAX_BUNDLE_TEXT_BYTES * 2, 8]
 
     for index, unit in enumerate(units):
         if not unit.startswith("diff --git "):
@@ -9839,6 +10095,19 @@ def redact_deletion_only_secret_values(
             if new_path is not None and new_path in expected_paths
             else None
         )
+        if (
+            git_context is not None and new_dialect is not None
+            and old_path == new_path and new_path in expected_paths
+            and new_path not in deletion_only_paths | mixed_deletion_paths
+            and speculative_partial_sentinel_only(new_content, new_dialect)
+            and (
+                not secret_text_risk(old_content, javascript_dialect=old_dialect)
+                or speculative_partial_sentinel_only(old_content, new_dialect)
+            )
+        ):
+            verified = verified_git_diff_context(git_context, unit, new_path, context_budget)
+            if verified is not None:
+                old_content, new_content = verified
         old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
         new_risk = secret_text_risk(
             new_content,
@@ -10279,6 +10548,7 @@ def validate_review_patch(
     mixed_deletion_paths: set[str] | None = None,
     additional_secret_context: str = "",
     known_secret_fragments_out: set[str] | None = None,
+    git_context: tuple[Path, str, str] | None = None,
 ) -> str:
     patch_bytes = len(patch.encode("utf-8"))
     if limit is not None and patch_bytes > limit:
@@ -10296,6 +10566,7 @@ def validate_review_patch(
         (mixed_deletion_paths or set()) - blocked_paths,
         additional_secret_context,
         known_secret_fragments_out,
+        git_context,
     )
     patch = redact_review_patch_metadata(patch)
     patch_bytes = len(patch.encode("utf-8"))
@@ -10809,14 +11080,21 @@ def branch_bundle(
 ) -> tuple[str, bool]:
     base_ref = validate_git_ref(repo, base_ref, "base")
     diff_range = f"{base_ref}...HEAD"
-    branch_patch = git(
+    branch_patch_bytes = git_bytes(
         repo,
         "diff",
         *SAFE_DIFF_FLAGS,
         "--patch",
         "--end-of-options",
         diff_range,
-    )
+    ).stdout
+    try:
+        branch_patch = branch_patch_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(
+            "refusing non-UTF-8 Git output because paths and diff content "
+            "cannot be validated without loss"
+        ) from exc
     branch_paths = git_path_list(
         repo,
         "diff",
@@ -10863,6 +11141,7 @@ def branch_bundle(
         branch_patch,
         deletion_only_paths=deletion_only_paths,
         known_secret_fragments_out=known_secret_fragments_out,
+        git_context=(repo, base_ref, "HEAD"),
     )
     return "\n\n".join(
         [
