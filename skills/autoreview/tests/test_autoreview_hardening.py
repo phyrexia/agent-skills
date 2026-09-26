@@ -931,6 +931,288 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
                 self.helper["branch_bundle"](repo, base)
 
+    def test_resource_binary_exclusion_is_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            logo = repo / "assets" / "logo.png"
+            logo.parent.mkdir()
+            logo.write_bytes(b"\x89PNG\r\n\0base")
+            git(repo, "add", "assets/logo.png")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            logo.write_bytes(b"\x89PNG\r\n\0changed")
+
+            with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+                self.helper["local_bundle"](repo)
+            with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+                self.helper["local_bundle"](repo, exclude_resource_binaries=False)
+
+            git(repo, "add", "assets/logo.png")
+            git(repo, "commit", "-q", "-m", "png change")
+            for bundle_call in (
+                lambda: self.helper["commit_bundle"](repo, "HEAD"),
+                lambda: self.helper["branch_bundle"](repo, base),
+                lambda: self.helper["commit_bundle"](
+                    repo, "HEAD", exclude_resource_binaries=False
+                ),
+                lambda: self.helper["branch_bundle"](
+                    repo, base, exclude_resource_binaries=False
+                ),
+            ):
+                with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+                    bundle_call()
+
+    def test_resource_binary_exclusion_excludes_and_declares_capped_resource(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            logo = repo / "assets" / "logo.png"
+            logo.parent.mkdir()
+            logo.write_bytes(b"\x89PNG\r\n\0base")
+            source = repo / "app.txt"
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            logo.write_bytes(b"\x89PNG\r\n\0changed")
+            source.write_text("reviewed change\n", encoding="utf-8")
+
+            def assert_excluded_and_declared(text: str, truncated: bool) -> None:
+                self.assertIn("# Binary Resources Not Reviewed", text)
+                self.assertIn(
+                    "no revisados (recurso binario): assets/logo.png",
+                    text,
+                )
+                self.assertNotIn("Binary files a/assets/logo.png", text)
+                self.assertIn("reviewed change", text)
+                self.assertFalse(truncated)
+
+            excluded: set[str] = set()
+            text, truncated = self.helper["local_bundle"](
+                repo,
+                exclude_resource_binaries=True,
+                resource_binaries_out=excluded,
+            )
+            assert_excluded_and_declared(text, truncated)
+            self.assertEqual(excluded, {"assets/logo.png"})
+
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "png change")
+            for label, bundle_call in (
+                ("commit", lambda: self.helper["commit_bundle"](
+                    repo,
+                    "HEAD",
+                    exclude_resource_binaries=True,
+                    resource_binaries_out=excluded,
+                )),
+                ("branch", lambda: self.helper["branch_bundle"](
+                    repo,
+                    base,
+                    exclude_resource_binaries=True,
+                    resource_binaries_out=excluded,
+                )),
+            ):
+                with self.subTest(bundle=label):
+                    text, truncated = bundle_call()
+                    assert_excluded_and_declared(text, truncated)
+            self.assertEqual(excluded, {"assets/logo.png"})
+
+    def test_resource_binary_exclusion_still_refuses_unreviewable_binaries(
+        self,
+    ) -> None:
+        cap = self.helper["MAX_RESOURCE_BINARY_BYTES"]
+        self.assertIsInstance(cap, int)
+        cases = {
+            "artifact.bin": b"\0payload",
+            "tool.exe": b"\0payload",
+            "photo.bmp": b"\0payload",
+            "clip.avi": b"\0payload",
+            "oversized.png": b"\0" + b"a" * (cap + 1),
+        }
+        for name, content in cases.items():
+            with (
+                self.subTest(path=name),
+                tempfile.TemporaryDirectory() as tempdir,
+            ):
+                repo = init_repo(Path(tempdir))
+                source = repo / "app.txt"
+                source.write_text("base\n", encoding="utf-8")
+                git(repo, "add", "app.txt")
+                git(repo, "commit", "-q", "-m", "base")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                (repo / name).write_bytes(content)
+                # local mode only refuses tracked binary diffs; untracked
+                # binaries are already omitted from the bundle.
+                git(repo, "add", name)
+
+                with self.assertRaises(SystemExit) as error:
+                    self.helper["local_bundle"](
+                        repo, exclude_resource_binaries=True
+                    )
+                self.assertIn("refusing binary changes", str(error.exception))
+                self.assertIn(name, str(error.exception))
+
+                git(repo, "commit", "-q", "-m", "binary change")
+                for bundle_call in (
+                    lambda: self.helper["commit_bundle"](
+                        repo, "HEAD", exclude_resource_binaries=True
+                    ),
+                    lambda: self.helper["branch_bundle"](
+                        repo, base, exclude_resource_binaries=True
+                    ),
+                ):
+                    with self.assertRaises(SystemExit) as error:
+                        bundle_call()
+                    self.assertIn("refusing binary changes", str(error.exception))
+                    self.assertIn(name, str(error.exception))
+
+    def test_resource_binary_exclusion_covers_video_assets(self) -> None:
+        # The change that motivated the option shipped a video asset
+        # (public/videos/services/services-loop.mp4); it must be excluded and
+        # declared like any other known resource binary.
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            video = repo / "public" / "videos" / "services-loop.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"\0ftypisom" + b"a" * 2048)
+            source = repo / "Services.tsx"
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            video.write_bytes(b"\0ftypisom" + b"b" * 1024)
+            source.write_text("reviewed change\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "shrink video")
+
+            excluded: set[str] = set()
+            bundle, _truncated = self.helper["branch_bundle"](
+                repo,
+                base,
+                exclude_resource_binaries=True,
+                resource_binaries_out=excluded,
+            )
+
+            self.assertEqual(excluded, {"public/videos/services-loop.mp4"})
+            self.assertIn(
+                "no revisados (recurso binario): public/videos/services-loop.mp4",
+                bundle,
+            )
+            self.assertNotIn(
+                "Binary files a/public/videos/services-loop.mp4",
+                bundle,
+            )
+            self.assertIn("reviewed change", bundle)
+
+    def test_excluded_resource_binaries_are_still_secret_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            logo = repo / "logo.png"
+            logo.write_bytes(b"\x89PNG\r\n\0base")
+            git(repo, "add", "logo.png")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            logo.write_bytes(b"\x89PNG\r\n\0reviewed-secret-marker")
+            git(repo, "add", "logo.png")
+            git(repo, "commit", "-q", "-m", "png change")
+
+            bundle, _truncated = self.helper["branch_bundle"](
+                repo,
+                base,
+                exclude_resource_binaries=True,
+                resource_binaries_out=set(),
+            )
+            self.assertNotIn("Binary files a/logo.png", bundle)
+
+            with tempfile.TemporaryDirectory() as scan_dir:
+                scan_repo = Path(scan_dir)
+                self.helper["prepare_trufflehog_history"](
+                    repo,
+                    "branch",
+                    base,
+                    "HEAD",
+                    scan_repo,
+                )
+                commits = git(scan_repo, "log", "--reverse", "--format=%H").splitlines()
+                scanned = subprocess.run(
+                    ["git", "show", f"{commits[1]}:logo.png"],
+                    cwd=scan_repo,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertIn(b"reviewed-secret-marker", scanned.stdout)
+
+    def test_excluded_resource_binaries_are_declared_in_the_verdict(self) -> None:
+        report = {
+            "findings": [],
+            "overall_correctness": "patch is correct",
+            "overall_explanation": "engine verdict",
+            "overall_confidence": 0.9,
+        }
+        self.helper["annotate_excluded_resource_binaries"](
+            report,
+            {"assets/logo.png", "fonts/site.woff2"},
+        )
+
+        explanation = report["overall_explanation"]
+        self.assertTrue(
+            explanation.startswith("no revisados (recurso binario): "),
+            explanation,
+        )
+        self.assertIn("assets/logo.png", explanation)
+        self.assertIn("fonts/site.woff2", explanation)
+        self.assertIn("engine verdict", explanation)
+
+        unchanged = dict(report)
+        unchanged["overall_explanation"] = "engine verdict"
+        self.helper["annotate_excluded_resource_binaries"](unchanged, set())
+        self.assertEqual(unchanged["overall_explanation"], "engine verdict")
+
+        long_report = dict(report)
+        long_report["overall_explanation"] = "x" * 3000
+        self.helper["annotate_excluded_resource_binaries"](
+            long_report,
+            {"assets/logo.png"},
+        )
+        self.assertTrue(
+            long_report["overall_explanation"].startswith(
+                "no revisados (recurso binario): "
+            )
+        )
+        self.assertLessEqual(len(long_report["overall_explanation"]), 3000)
+
+    def test_exclude_resource_binaries_flag_and_env_default(self) -> None:
+        parse_args = self.helper["parse_args"]
+        env = os.environ.copy()
+        env.pop("AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES", None)
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(sys, "argv", ["autoreview"]):
+                self.assertFalse(parse_args().exclude_resource_binaries)
+        with mock.patch.dict(
+            os.environ, {**env, "AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES": "1"}, clear=True
+        ):
+            with mock.patch.object(sys, "argv", ["autoreview"]):
+                self.assertTrue(parse_args().exclude_resource_binaries)
+            with mock.patch.object(
+                sys, "argv", ["autoreview", "--exclude-resource-binaries"]
+            ):
+                self.assertTrue(parse_args().exclude_resource_binaries)
+            with mock.patch.object(
+                sys, "argv", ["autoreview", "--no-exclude-resource-binaries"]
+            ):
+                self.assertFalse(parse_args().exclude_resource_binaries)
+        with mock.patch.dict(
+            os.environ, {**env, "AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES": "flase"}, clear=True
+        ):
+            with mock.patch.object(sys, "argv", ["autoreview"]):
+                with self.assertRaisesRegex(
+                    SystemExit, "invalid boolean environment value"
+                ):
+                    parse_args()
+
     def test_gitlink_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))

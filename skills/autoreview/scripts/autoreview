@@ -30,7 +30,7 @@ import time
 import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterable, NamedTuple
 
 
 ENGINES = ("codex", "claude", "amp", "droid", "copilot", "pi", "kimi", "opencode", "cursor")
@@ -58,6 +58,32 @@ DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
 DIFF_HUNK_PARTIAL_MARKER = "\0autoreview-diff-hunk-partial\0"
 DIFF_HUNK_PARTIAL_TAIL_MARKER = "\0autoreview-diff-hunk-partial-tail\0"
 LOCAL_DIFF_VALIDATION_BOUNDARY = "\n[autoreview local diff validation boundary]\n"
+# Binary changes are refused by default because their contents cannot be
+# reviewed. --exclude-resource-binaries lets known static resource binaries
+# (closed extension list, capped size) leave the reviewed patch, and they are
+# declared as never reviewed wherever the verdict is rendered. The list covers
+# images, fonts, and web video: the change that motivated this option shipped
+# a video asset (public/videos/services/services-loop.mp4, pedido #8498).
+RESOURCE_BINARY_EXTENSIONS = frozenset(
+    {
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "avif",
+        "ico",
+        "woff",
+        "woff2",
+        "ttf",
+        "otf",
+        "mp4",
+        "webm",
+        "mov",
+    }
+)
+MAX_RESOURCE_BINARY_BYTES = 5 * 1024 * 1024
+RESOURCE_BINARY_NOT_REVIEWED = "no revisados (recurso binario)"
 ENGINE_GIT_CONFIG_OVERRIDES = (
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -10307,24 +10333,180 @@ def validate_review_patch(
     return patch
 
 
-def require_no_binary_diff(label: str, numstat: str) -> None:
-    binary_paths: list[str] = []
+def resource_binary_path(path: str) -> bool:
+    """Whether a changed path is a known static resource by extension alone."""
+    name = PurePosixPath(path).name
+    _stem, dot, extension = name.rpartition(".")
+    return bool(dot) and extension.lower() in RESOURCE_BINARY_EXTENSIONS
+
+
+def binary_diff_paths(numstat: str) -> list[str]:
+    paths: list[str] = []
     for record in numstat.split("\0"):
         if not record:
             continue
         fields = record.split("\t", 2)
         if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
-            binary_paths.append(fields[2])
-    if binary_paths:
+            paths.append(fields[2])
+    return paths
+
+
+def raw_diff_change_oids(
+    raw_diff: str,
+) -> dict[str, tuple[str, str, str, str]]:
+    """Map changed path -> (src mode, src oid, dst mode, dst oid) of a -z --raw diff.
+
+    With ``-z`` each record is two NUL-terminated fields: the ``:`` metadata and
+    the literal path, so paths stay unquoted and unescaped.
+    """
+    changes: dict[str, tuple[str, str, str, str]] = {}
+    records = raw_diff.split("\0")
+    for index, record in enumerate(records):
+        if not record.startswith(":"):
+            continue
+        fields = record.split()
+        # Five fields: the sixth and beyond are extra rename paths, which
+        # --no-renames (SAFE_DIFF_FLAGS) never produces.
+        if len(fields) != 5:
+            continue
+        path = records[index + 1] if index + 1 < len(records) else ""
+        if not path:
+            continue
+        src_mode, dst_mode, src_oid, dst_oid = (
+            fields[0].lstrip(":"),
+            fields[1],
+            fields[2],
+            fields[3],
+        )
+        changes[path] = (src_mode, src_oid, dst_mode, dst_oid)
+    return changes
+
+
+def raw_diff_blob_sizes(repo: Path, raw_diff: str) -> dict[str, int]:
+    """Largest blob size on either side of each binary change.
+
+    A path is absent from the result when any side's size cannot be measured,
+    which makes the caller refuse the change instead of excluding it.
+    """
+    sizes: dict[str, int] = {}
+    for path, (src_mode, src_oid, dst_mode, dst_oid) in raw_diff_change_oids(
+        raw_diff
+    ).items():
+        measured: list[int] = []
+        for mode, oid in ((src_mode, src_oid), (dst_mode, dst_oid)):
+            if mode == "000000":
+                continue
+            if set(oid) == {"0"}:
+                # Unstaged local diffs hash the worktree side lazily.
+                try:
+                    size = os.stat(repo / path).st_size
+                except OSError:
+                    measured = []
+                    break
+            else:
+                result = git_result(repo, "cat-file", "-s", oid, check=False)
+                if result.returncode != 0:
+                    measured = []
+                    break
+                try:
+                    size = int(result.stdout.strip())
+                except ValueError:
+                    measured = []
+                    break
+            measured.append(size)
+        if measured:
+            sizes[path] = max(measured)
+    return sizes
+
+
+def resource_binary_declaration(paths: Iterable[str]) -> str:
+    listed = ", ".join(sorted(display_escape(path, 500) for path in set(paths)))
+    return f"{RESOURCE_BINARY_NOT_REVIEWED}: {listed}"
+
+
+def annotate_excluded_resource_binaries(
+    report: dict[str, Any],
+    excluded: Iterable[str],
+) -> None:
+    """Keep never-reviewed resource binaries visible in the rendered verdict."""
+    if not excluded:
+        return
+    report["overall_explanation"] = bounded_field(
+        f"{resource_binary_declaration(excluded)}\n\n{report['overall_explanation']}",
+        3000,
+    )
+
+
+def require_no_binary_diff(
+    label: str,
+    numstat: str,
+    *,
+    repo: Path | None = None,
+    raw_diff: str | None = None,
+    exclude_resource_binaries: bool = False,
+) -> list[str]:
+    """Refuse binary changes whose contents cannot be reviewed.
+
+    With ``exclude_resource_binaries`` on, known resource binaries within
+    ``MAX_RESOURCE_BINARY_BYTES`` on both sides of the change are returned so the
+    caller can drop them from the reviewed patch and declare them as never
+    reviewed. Every other binary change is refused exactly as before.
+    """
+    binary_paths = binary_diff_paths(numstat)
+    excluded: list[str] = []
+    refused: list[str] = []
+    sizes = (
+        raw_diff_blob_sizes(repo, raw_diff)
+        if exclude_resource_binaries and repo is not None and raw_diff is not None
+        else {}
+    )
+    for path in binary_paths:
+        size = sizes.get(path)
+        if (
+            exclude_resource_binaries
+            and resource_binary_path(path)
+            and size is not None
+            and size <= MAX_RESOURCE_BINARY_BYTES
+        ):
+            excluded.append(path)
+        else:
+            refused.append(path)
+    if refused:
         details = "\n".join(
             f"- {display_escape(path, 500)}"
-            for path in binary_paths[:20]
+            for path in refused[:20]
         )
-        more = f"\n... {len(binary_paths) - 20} more" if len(binary_paths) > 20 else ""
+        more = f"\n... {len(refused) - 20} more" if len(refused) > 20 else ""
         raise SystemExit(
             f"refusing binary changes in {label} because their contents cannot be reviewed:\n"
             f"{details}{more}"
         )
+    return excluded
+
+
+def omit_excluded_binary_diff_units(
+    patch: str,
+    paths: list[str],
+    excluded: Iterable[str],
+) -> str:
+    """Drop the diff units of resource binaries excluded from review."""
+    excluded_paths = set(excluded)
+    if not excluded_paths:
+        return patch
+    units = review_bundle_units(patch)
+    diff_indexes = [
+        index for index, unit in enumerate(units) if unit.startswith("diff --git ")
+    ]
+    if len(diff_indexes) != len(paths):
+        raise SystemExit(
+            "internal error: binary diff units do not match the changed paths"
+        )
+    path_by_unit = dict(zip(diff_indexes, paths))
+    return "".join(
+        unit
+        for index, unit in enumerate(units)
+        if path_by_unit.get(index) not in excluded_paths
+    )
 
 
 def require_no_gitlink_diff(label: str, raw_diff: str) -> None:
@@ -10481,24 +10663,35 @@ def redact_secret_like_review_metadata(text: str) -> str:
 def local_bundle(
     repo: Path,
     known_secret_fragments_out: set[str] | None = None,
+    *,
+    exclude_resource_binaries: bool = False,
+    resource_binaries_out: set[str] | None = None,
 ) -> tuple[str, bool]:
     staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
     unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
-    require_no_binary_diff(
+    staged_raw_diff = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z")
+    unstaged_raw_diff = git(repo, "diff", *SAFE_DIFF_FLAGS, "--raw", "-z")
+    staged_excluded_binaries = require_no_binary_diff(
         "local staged diff",
         git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
+        repo=repo,
+        raw_diff=staged_raw_diff,
+        exclude_resource_binaries=exclude_resource_binaries,
     )
-    require_no_binary_diff(
+    unstaged_excluded_binaries = require_no_binary_diff(
         "local unstaged diff",
         git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
+        repo=repo,
+        raw_diff=unstaged_raw_diff,
+        exclude_resource_binaries=exclude_resource_binaries,
     )
     require_no_gitlink_diff(
         "local staged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z"),
+        staged_raw_diff,
     )
     require_no_gitlink_diff(
         "local unstaged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--raw", "-z"),
+        unstaged_raw_diff,
     )
     staged_paths = git_path_list(
         repo,
@@ -10515,6 +10708,25 @@ def local_bundle(
         "--name-only",
         "-z",
     )
+    excluded_binaries = staged_excluded_binaries + unstaged_excluded_binaries
+    if resource_binaries_out is not None:
+        resource_binaries_out.update(excluded_binaries)
+    staged_patch = omit_excluded_binary_diff_units(
+        staged_patch,
+        staged_paths,
+        staged_excluded_binaries,
+    )
+    unstaged_patch = omit_excluded_binary_diff_units(
+        unstaged_patch,
+        unstaged_paths,
+        unstaged_excluded_binaries,
+    )
+    staged_paths = [
+        path for path in staged_paths if path not in set(staged_excluded_binaries)
+    ]
+    unstaged_paths = [
+        path for path in unstaged_paths if path not in set(unstaged_excluded_binaries)
+    ]
     untracked_snapshots, omitted_untracked = collect_untracked_file_snapshots(repo)
     untracked = [rel for rel, _content, _truncated in untracked_snapshots]
     omitted_tracked = len(
@@ -10635,6 +10847,9 @@ def local_bundle(
             ),
         ]
     input_truncated = False
+    if excluded_binaries:
+        parts.append("# Binary Resources Not Reviewed")
+        parts.append(resource_binary_declaration(excluded_binaries))
     if untracked:
         parts.append("# Untracked Files")
         for rel, content, truncated in untracked_snapshots:
@@ -10806,6 +11021,9 @@ def branch_bundle(
     repo: Path,
     base_ref: str,
     known_secret_fragments_out: set[str] | None = None,
+    *,
+    exclude_resource_binaries: bool = False,
+    resource_binaries_out: set[str] | None = None,
 ) -> tuple[str, bool]:
     base_ref = validate_git_ref(repo, base_ref, "base")
     diff_range = f"{base_ref}...HEAD"
@@ -10826,7 +11044,16 @@ def branch_bundle(
         "--end-of-options",
         diff_range,
     )
-    require_no_binary_diff(
+    branch_raw_diff = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--raw",
+        "-z",
+        "--end-of-options",
+        diff_range,
+    )
+    excluded_binaries = require_no_binary_diff(
         "branch diff",
         git(
             repo,
@@ -10837,19 +11064,24 @@ def branch_bundle(
             "--end-of-options",
             diff_range,
         ),
+        repo=repo,
+        raw_diff=branch_raw_diff,
+        exclude_resource_binaries=exclude_resource_binaries,
     )
     require_no_gitlink_diff(
         "branch diff",
-        git(
-            repo,
-            "diff",
-            *SAFE_DIFF_FLAGS,
-            "--raw",
-            "-z",
-            "--end-of-options",
-            diff_range,
-        ),
+        branch_raw_diff,
     )
+    if resource_binaries_out is not None:
+        resource_binaries_out.update(excluded_binaries)
+    branch_patch = omit_excluded_binary_diff_units(
+        branch_patch,
+        branch_paths,
+        excluded_binaries,
+    )
+    branch_paths = [
+        path for path in branch_paths if path not in set(excluded_binaries)
+    ]
     omitted_tracked = bool(tracked_sensitive_paths(branch_paths))
     deletion_only_paths = review_deletion_only_paths(
         repo,
@@ -10864,37 +11096,42 @@ def branch_bundle(
         deletion_only_paths=deletion_only_paths,
         known_secret_fragments_out=known_secret_fragments_out,
     )
-    return "\n\n".join(
-        [
-            "# Branch Diff",
-            (
-                REVIEW_SECURITY_REDACTION
-                if secret_text_risk(base_ref)
-                else f"base: {base_ref}"
-            ),
-            (
-                REVIEW_SECURITY_REDACTION
-                if omitted_tracked
-                else redact_secret_like_review_metadata(
-                    git(
-                        repo,
-                        "diff",
-                        *SAFE_DIFF_FLAGS,
-                        "--stat",
-                        "--end-of-options",
-                        diff_range,
-                    )
+    sections = [
+        "# Branch Diff",
+        (
+            REVIEW_SECURITY_REDACTION
+            if secret_text_risk(base_ref)
+            else f"base: {base_ref}"
+        ),
+        (
+            REVIEW_SECURITY_REDACTION
+            if omitted_tracked
+            else redact_secret_like_review_metadata(
+                git(
+                    repo,
+                    "diff",
+                    *SAFE_DIFF_FLAGS,
+                    "--stat",
+                    "--end-of-options",
+                    diff_range,
                 )
-            ),
-            branch_patch,
-        ]
-    ), False
+            )
+        ),
+        branch_patch,
+    ]
+    if excluded_binaries:
+        sections.append("# Binary Resources Not Reviewed")
+        sections.append(resource_binary_declaration(excluded_binaries))
+    return "\n\n".join(sections), False
 
 
 def commit_bundle(
     repo: Path,
     commit_ref: str,
     known_secret_fragments_out: set[str] | None = None,
+    *,
+    exclude_resource_binaries: bool = False,
+    resource_binaries_out: set[str] | None = None,
 ) -> tuple[str, bool]:
     commit_ref = validate_git_ref(repo, commit_ref, "commit")
     parents = git(repo, "rev-list", "--parents", "-n", "1", commit_ref).split()
@@ -10922,7 +11159,17 @@ def commit_bundle(
         "--end-of-options",
         commit_ref,
     )
-    require_no_binary_diff(
+    commit_raw_diff = git(
+        repo,
+        "show",
+        *SAFE_DIFF_FLAGS,
+        "--raw",
+        "--format=",
+        "-z",
+        "--end-of-options",
+        commit_ref,
+    )
+    excluded_binaries = require_no_binary_diff(
         "commit diff",
         git(
             repo,
@@ -10934,20 +11181,24 @@ def commit_bundle(
             "--end-of-options",
             commit_ref,
         ),
+        repo=repo,
+        raw_diff=commit_raw_diff,
+        exclude_resource_binaries=exclude_resource_binaries,
     )
     require_no_gitlink_diff(
         "commit diff",
-        git(
-            repo,
-            "show",
-            *SAFE_DIFF_FLAGS,
-            "--raw",
-            "--format=",
-            "-z",
-            "--end-of-options",
-            commit_ref,
-        ),
+        commit_raw_diff,
     )
+    if resource_binaries_out is not None:
+        resource_binaries_out.update(excluded_binaries)
+    commit_patch = omit_excluded_binary_diff_units(
+        commit_patch,
+        commit_paths,
+        excluded_binaries,
+    )
+    commit_paths = [
+        path for path in commit_paths if path not in set(excluded_binaries)
+    ]
     omitted_tracked = bool(tracked_sensitive_paths(commit_paths))
     commit_summary = git(
         repo,
@@ -10974,18 +11225,20 @@ def commit_bundle(
     )
     if omitted_tracked or secret_text_risk(commit_summary):
         commit_summary = REVIEW_SECURITY_REDACTION
-    return "\n\n".join(
-        [
-            "# Commit Diff",
-            (
-                REVIEW_SECURITY_REDACTION
-                if secret_text_risk(commit_ref)
-                else f"commit: {commit_ref}"
-            ),
-            commit_summary,
-            commit_patch,
-        ]
-    ), False
+    sections = [
+        "# Commit Diff",
+        (
+            REVIEW_SECURITY_REDACTION
+            if secret_text_risk(commit_ref)
+            else f"commit: {commit_ref}"
+        ),
+        commit_summary,
+        commit_patch,
+    ]
+    if excluded_binaries:
+        sections.append("# Binary Resources Not Reviewed")
+        sections.append(resource_binary_declaration(excluded_binaries))
+    return "\n\n".join(sections), False
 
 
 def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> set[str]:
@@ -15005,6 +15258,23 @@ def parse_args() -> argparse.Namespace:
             "WebSearch",
         ),
     )
+    parser.add_argument(
+        "--exclude-resource-binaries",
+        dest="exclude_resource_binaries",
+        action="store_true",
+        default=None,
+        help=(
+            "Exclude known resource binaries (png, jpg, jpeg, gif, webp, avif, ico, woff, woff2, ttf, otf, mp4, webm, mov) "
+            "up to 5 MiB per side from the reviewed patch and declare them as never reviewed. "
+            "Every other binary change is still refused. Env default: AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES."
+        ),
+    )
+    parser.add_argument(
+        "--no-exclude-resource-binaries",
+        dest="exclude_resource_binaries",
+        action="store_false",
+        help="Refuse every binary change, even known resource binaries. Overrides AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES.",
+    )
     parser.add_argument("--prompt", action="append", help="Additional review instruction text.")
     parser.add_argument("--prompt-file", action="append", help="Additional review instruction file.")
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
@@ -15071,6 +15341,8 @@ def parse_args() -> argparse.Namespace:
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
+    if args.exclude_resource_binaries is None:
+        args.exclude_resource_binaries = env_truthy("AUTOREVIEW_EXCLUDE_RESOURCE_BINARIES")
     if args.engine not in ENGINES:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
     return args
@@ -16371,10 +16643,14 @@ def main_impl() -> int:
     review_source_snapshot = source_tree_snapshot(repo)
     run_trufflehog_preflight(repo, target, target_ref, args.commit)
     known_secret_fragments: set[str] = set()
+    excluded_resource_binaries: set[str] = set()
+    exclude_resource_binaries = bool(args.exclude_resource_binaries)
     if target == "local":
         bundle, bundle_truncated = local_bundle(
             repo,
             known_secret_fragments,
+            exclude_resource_binaries=exclude_resource_binaries,
+            resource_binaries_out=excluded_resource_binaries,
         )
     elif target == "branch":
         assert target_ref
@@ -16382,12 +16658,16 @@ def main_impl() -> int:
             repo,
             target_ref,
             known_secret_fragments,
+            exclude_resource_binaries=exclude_resource_binaries,
+            resource_binaries_out=excluded_resource_binaries,
         )
     else:
         bundle, bundle_truncated = commit_bundle(
             repo,
             args.commit,
             known_secret_fragments,
+            exclude_resource_binaries=exclude_resource_binaries,
+            resource_binaries_out=excluded_resource_binaries,
         )
         target_ref = args.commit
     extra_prompt, prompt_truncated = load_extra_prompt(args, repo)
@@ -16412,6 +16692,11 @@ def main_impl() -> int:
         )
     changed_paths = review_paths(repo, target, target_ref, args.commit)
     print(f"bundle: {utf8_size(bundle)} bytes; review passes: {len(prompts)}")
+    if excluded_resource_binaries:
+        print(
+            "resource binaries excluded from review; "
+            f"{resource_binary_declaration(excluded_resource_binaries)}"
+        )
     if source_tree_snapshot(repo) != review_source_snapshot:
         raise SystemExit(
             "source changed while the review bundle was being created; "
@@ -16457,6 +16742,7 @@ def main_impl() -> int:
         )
         return 1
 
+    annotate_excluded_resource_binaries(report, excluded_resource_binaries)
     if args.json_output:
         atomic_write_text(
             Path(args.json_output),
