@@ -7781,6 +7781,20 @@ else:
             with self.assertRaisesRegex(SystemExit, "missing from --help: --no-context-files \\(--help exit 0, "):
                 self.helper["ensure_pi_isolation_supported"](args, repo)
 
+    def test_exit_message_keeps_the_engine_error_tail(self) -> None:
+        echoed_prompt = "user\n" + "Review the change bundle.\n" * 1000
+        message = (
+            "codex engine failed (1)\n"
+            + echoed_prompt
+            + "ERROR: You've hit your usage limit.\n"
+        )
+        bounded = self.helper["bounded_exit_message"](message)
+        self.assertLessEqual(len(bounded), self.helper["EXIT_MESSAGE_LIMIT"])
+        self.assertTrue(bounded.startswith("codex engine failed (1)\n"))
+        self.assertIn("...[truncated]...", bounded)
+        self.assertTrue(bounded.endswith("ERROR: You've hit your usage limit.\n"))
+        self.assertEqual(self.helper["bounded_exit_message"]("short\x1b[2J"), "short\\x1b[2J")
+
     def test_claude_fable_alias_requires_fable_safe_mode_version(self) -> None:
         args = argparse.Namespace(
             claude_bin="claude",

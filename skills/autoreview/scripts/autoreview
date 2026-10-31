@@ -16787,14 +16787,28 @@ def main_impl() -> int:
     return 1 if has_findings or overall_incorrect else 0
 
 
+EXIT_MESSAGE_LIMIT = 4000
+EXIT_MESSAGE_HEAD = 1000
+
+
+def bounded_exit_message(text: str) -> str:
+    # Engine failures embed the CLI's own output, and CLIs such as codex echo the
+    # whole review prompt before printing the actual error last. Keep the head
+    # (what failed) and the tail (why), so a quota or auth error stays visible.
+    rendered = display_escape(text, max(1000, len(text) * 10), multiline=True)
+    if len(rendered) <= EXIT_MESSAGE_LIMIT:
+        return rendered
+    marker = "\n...[truncated]...\n"
+    tail = EXIT_MESSAGE_LIMIT - EXIT_MESSAGE_HEAD - len(marker)
+    return rendered[:EXIT_MESSAGE_HEAD] + marker + rendered[-tail:]
+
+
 def sanitized_main() -> int:
     try:
         return main()
     except SystemExit as exc:
         if isinstance(exc.code, str):
-            raise SystemExit(
-                display_escape(exc.code, 4000, multiline=True)
-            ) from None
+            raise SystemExit(bounded_exit_message(exc.code)) from None
         raise
 
 
