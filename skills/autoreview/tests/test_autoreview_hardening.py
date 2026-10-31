@@ -7730,6 +7730,71 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertEqual(selected, configured_temp.resolve())
 
+    def write_pipe_truncating_cli(self, path: Path, version: str, help_flags: str) -> Path:
+        # Mimics Node/Bun CLIs on macOS: help written to a pipe is cut at 512
+        # bytes when the process exits, while a regular file gets all of it.
+        return self.helper["write_executable"](path, f'''#!/usr/bin/env python3
+import os
+import stat
+import sys
+
+if "--version" in sys.argv:
+    print({version!r})
+else:
+    text = "Usage: cli\\n" + " " * 16384
+    text += {help_flags!r} + "\\n"
+    if stat.S_ISFIFO(os.fstat(1).st_mode):
+        text = text[:512]
+    sys.stdout.write(text)
+''')
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_claude_probe_captures_help_from_pipe_sensitive_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            cli = self.write_pipe_truncating_cli(
+                root / "claude",
+                "2.1.316 (Claude Code)",
+                "--safe-mode --setting-sources --strict-mcp-config --disallowedTools --tools",
+            )
+            args = argparse.Namespace(claude_bin=str(cli), model=None, fallback_model=None)
+            self.helper["ensure_claude_isolation_supported"](args, repo)
+            cli.write_text(cli.read_text().replace("--safe-mode", "--unsafe-mode"))
+            with self.assertRaisesRegex(SystemExit, "missing from --help: --safe-mode \\(--help exit 0, "):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_pi_probe_captures_help_from_pipe_sensitive_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            cli = self.write_pipe_truncating_cli(
+                root / "pi",
+                "1.4.0",
+                "--print --no-approve --no-session --no-context-files --no-extensions "
+                "--no-skills --no-prompt-templates --no-themes --no-tools --thinking",
+            )
+            args = argparse.Namespace(pi_bin=str(cli))
+            self.assertEqual(self.helper["ensure_pi_isolation_supported"](args, repo), str(cli))
+            cli.write_text(cli.read_text().replace("--no-context-files", "--context-files"))
+            with self.assertRaisesRegex(SystemExit, "missing from --help: --no-context-files \\(--help exit 0, "):
+                self.helper["ensure_pi_isolation_supported"](args, repo)
+
+    def test_exit_message_keeps_the_engine_error_tail(self) -> None:
+        echoed_prompt = "user\n" + "Review the change bundle.\n" * 1000
+        message = (
+            "codex engine failed (1)\n"
+            + echoed_prompt
+            + "ERROR: You've hit your usage limit.\n"
+        )
+        bounded = self.helper["bounded_exit_message"](message)
+        self.assertLessEqual(len(bounded), self.helper["EXIT_MESSAGE_LIMIT"])
+        self.assertTrue(bounded.startswith("codex engine failed (1)\n"))
+        self.assertIn("...[truncated]...", bounded)
+        self.assertTrue(bounded.endswith("ERROR: You've hit your usage limit.\n"))
+        self.assertEqual(self.helper["bounded_exit_message"]("short\x1b[2J"), "short\\x1b[2J")
+
     def test_claude_fable_alias_requires_fable_safe_mode_version(self) -> None:
         args = argparse.Namespace(
             claude_bin="claude",
