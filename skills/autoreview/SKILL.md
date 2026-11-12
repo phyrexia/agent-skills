@@ -423,6 +423,19 @@ Amp cloud/orb agent execution is deliberately unsupported. In current Amp CLI be
 
 Codex uses a named permission profile that grants read access only to an empty temporary workspace. This is narrower than repository-root access, which would expose ignored credentials, and narrower than the legacy `read-only` sandbox, which permits reads across the host filesystem.
 
+### Session stores
+
+| Engine | Effective store during review | Retention |
+| ------ | ----------------------------- | --------- |
+| Codex | With linked file authentication, or no source home: temporary `$CODEX_HOME/sessions`. With keyring/auto authentication: source `$CODEX_HOME/sessions`. HOME and XDG cache/config/data/state roots are temporary in both cases. | Before runtime cleanup, copy only regular `rollout-*.jsonl` files to the source Codex home's `sessions`, or `~/.codex/sessions` when no source home exists, preserving the date path. Runs already using the source store need no copy. |
+| Claude | External `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`; HOME remains the user's home and XDG overrides are stripped. | Native transcripts remain there, including the directory keyed by the temporary review workspace. |
+| Pi | External `$PI_CODING_AGENT_DIR/sessions`, otherwise `~/.pi/agent/sessions`; HOME remains the user's home and XDG overrides are stripped. | Native JSONL sessions remain there under the encoded temporary workspace directory. |
+| OpenCode | No review subprocess is launched: isolation is unsupported. | No review session is created. |
+| Amp | Temporary HOME and XDG cache/config/data/state roots. | Local runtime state is deleted; no durable transcript export is implemented. The streamed outer turn contains only the adapter trigger/result, not the direct generation prompt. |
+| Kimi | Temporary HOME and `$KIMI_CODE_HOME`; XDG overrides are stripped. | Runtime session state is deleted; no durable transcript export is implemented. Only native OAuth credential refreshes persist through the existing credential link. |
+
+Codex transcript export runs on success, engine failure, and timeout. It never follows session symlinks or copies authentication, configuration, keyring, state, or log files. New directories use mode `0700`, transcripts use `0600`, and a completed temporary file in the destination directory is published atomically with an exclusive hard link so an existing name cannot be overwritten. Name collisions are skipped with a warning. Export failures warn on stderr without changing the review result. Platforms without the required no-follow directory-descriptor operations warn instead of weakening this boundary.
+
 ## Context Efficiency
 
 Run the helper directly so target selection, engine choice, structured validation, and exit status all stay in one path. If output is noisy, summarize the completed helper output after it returns; do not ask another agent or reviewer to rerun the review.
@@ -473,7 +486,7 @@ The helper:
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, `claude=claude-fable-5`, and `amp=openai/gpt-5.6-sol` with `high` reasoning; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch; Amp sends the bundle only through direct schema-constrained generation; Pi and Kimi receive the bundle with no tools
 - runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
-- keeps the session of every engine that writes one (Codex rollouts, Claude transcripts, Pi sessions) under its usual store (`$CODEX_HOME/sessions`, `$CLAUDE_CONFIG_DIR/projects`, `$PI_CODING_AGENT_DIR/sessions`), so `claude-usage` can measure the run; autoreview never passes `--ephemeral`, `--no-session-persistence`, or `--no-session`. Pi's capability probe does not require `--no-session` in `--help`
+- retains Codex rollouts, Claude transcripts, and Pi sessions in the stores described above so `claude-usage` can measure the run; autoreview never passes `--ephemeral`, `--no-session-persistence`, or `--no-session`. Pi's capability probe does not require `--no-session` in `--help`
 - runs Amp locally from an empty temporary workspace with isolated runtime roots, complete plugin inventory attestation that fails if any authenticated personal/workspace plugin exists, catch-all MCP denial verified by a no-spawn marker probe, a fixed outer trigger, one input-free adapter tool, and direct `amp.ai.generate`; requires `AMP_API_KEY`, refuses native Windows, and refuses cloud/orb agent execution
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined

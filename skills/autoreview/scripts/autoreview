@@ -12638,6 +12638,77 @@ def codex_command(
     return cmd
 
 
+def open_session_destination(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+def persist_codex_sessions(source: Path, destination: Path) -> None:
+    def warn(exc: Exception) -> None:
+        print(f"advertencia: no se pudo conservar la sesión de Codex: {exc}", file=sys.stderr)
+
+    try:
+        with contextlib.ExitStack() as stack:
+            try:
+                source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return
+            stack.callback(os.close, source_fd)
+
+            def walk_error(exc: OSError) -> None:
+                raise exc
+
+            for relative, _dirs, files, directory in os.fwalk(
+                ".", dir_fd=source_fd, follow_symlinks=False, onerror=walk_error,
+            ):
+                for name in files:
+                    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                        continue
+                    try:
+                        with contextlib.ExitStack() as file_stack:
+                            source_file = os.open(
+                                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=directory,
+                            )
+                            source_stream = file_stack.enter_context(os.fdopen(source_file, "rb"))
+                            if not stat.S_ISREG(os.fstat(source_stream.fileno()).st_mode):
+                                continue
+                            target = open_session_destination(destination / relative)
+                            file_stack.callback(os.close, target)
+                            temporary = f".autoreview-session-{secrets.token_hex(16)}.tmp"
+                            temporary_fd = os.open(
+                                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                0o600, dir_fd=target,
+                            )
+                            try:
+                                with os.fdopen(temporary_fd, "wb") as output:
+                                    os.fchmod(output.fileno(), 0o600)
+                                    shutil.copyfileobj(source_stream, output)
+                                    output.flush()
+                                    os.fsync(output.fileno())
+                                # Publicación atómica sin reemplazo; rename() podría sobrescribir.
+                                os.link(temporary, name, src_dir_fd=target, dst_dir_fd=target)
+                            finally:
+                                os.unlink(temporary, dir_fd=target)
+                    except Exception as exc:
+                        warn(exc)
+    except Exception as exc:
+        warn(exc)
+
+
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
@@ -12665,7 +12736,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         ) as workspace_dir, tempfile.TemporaryDirectory(
             prefix="autoreview-codex-runtime.",
             dir=temp_root,
-        ) as runtime_dir:
+        ) as runtime_dir, contextlib.ExitStack() as session_cleanup:
             review_root = Path(workspace_dir)
             runtime_root = Path(runtime_dir)
             runtime_home = runtime_root / "home"
@@ -12690,6 +12761,12 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 if file_auth_linked or source_codex_home is None
                 else source_codex_home
             )
+            if active_codex_home == runtime_codex_home:
+                session_cleanup.callback(
+                    persist_codex_sessions,
+                    runtime_codex_home / "sessions",
+                    (source_codex_home or (Path.home().resolve() / ".codex")) / "sessions",
+                )
             for index, model in enumerate(models):
                 output_path.write_text("")
                 cmd = codex_command(

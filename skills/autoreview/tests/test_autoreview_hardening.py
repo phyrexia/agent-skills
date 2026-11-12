@@ -8192,6 +8192,161 @@ else:
                 os.environ.clear()
                 os.environ.update(old)
 
+    @unittest.skipIf(os.name == "nt", "requires POSIX directory descriptors")
+    def test_codex_preserves_only_rollouts_before_runtime_cleanup(self) -> None:
+        for outcome in (0, 1, 124, "timeout"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir).resolve()
+                repo = root / "repo"
+                repo.mkdir()
+                home = root / "home"
+                codex_home = home / ".codex"
+                codex_home.mkdir(parents=True)
+                auth = codex_home / "auth.json"
+                auth.write_text('{"tokens":{}}')
+                relative = Path("2026/11/12")
+                existing = codex_home / "sessions" / relative / "rollout-existing.jsonl"
+                existing.parent.mkdir(parents=True)
+                existing.write_text("original\n")
+                outside = root / "outside"
+                outside.mkdir()
+                (outside / "rollout-private.jsonl").write_text("private\n")
+                runtime_paths: list[Path] = []
+
+                def fake_codex(cmd: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                    env = kwargs["env"]
+                    runtime = Path(env["CODEX_HOME"])
+                    runtime_paths.append(runtime)
+                    self.assertNotEqual(runtime, codex_home)
+                    self.assertNotEqual(Path(env["HOME"]), home)
+                    sessions = runtime / "sessions"
+                    day = sessions / relative
+                    day.mkdir(parents=True)
+                    (day / "rollout-review.jsonl").write_text('{"type":"session_meta"}\n')
+                    (day / "rollout-existing.jsonl").write_text("replacement\n")
+                    (day / "rollout-symlink.jsonl").symlink_to(outside / "rollout-private.jsonl")
+                    (sessions / "linked").symlink_to(outside, target_is_directory=True)
+                    os.mkfifo(day / "rollout-pipe.jsonl")
+                    (runtime / "rollout-outside.jsonl").write_text("excluded\n")
+                    for name in ("auth.json", "config.toml", "state.sqlite", "log.jsonl", "keyring.jsonl"):
+                        if name != "auth.json":
+                            (runtime / name).write_text("excluded\n")
+                        (day / name).write_text("excluded\n")
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired(cmd, 1)
+                    return subprocess.CompletedProcess(cmd, outcome, "review result", "engine detail")
+
+                args = argparse.Namespace(tools=True, model=None, stream_engine_output=False)
+                errors = io.StringIO()
+                with mock.patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(codex_home)}, clear=True), mock.patch.dict(
+                    self.helper["run_codex"].__globals__,
+                    {"codex_command": lambda *_args, **_kwargs: ["/trusted/codex"],
+                     "run_with_heartbeat": fake_codex},
+                ), contextlib.redirect_stderr(errors):
+                    if outcome == 0:
+                        self.assertEqual(self.helper["run_codex"](args, repo, "review"), "review result")
+                    elif outcome == "timeout":
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            self.helper["run_codex"](args, repo, "review")
+                    else:
+                        with self.assertRaisesRegex(SystemExit, rf"codex engine failed \({outcome}\)"):
+                            self.helper["run_codex"](args, repo, "review")
+
+                saved = existing.with_name("rollout-review.jsonl")
+                self.assertEqual(saved.read_text(), '{"type":"session_meta"}\n')
+                self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+                self.assertEqual(existing.read_text(), "original\n")
+                self.assertEqual(auth.read_text(), '{"tokens":{}}')
+                self.assertEqual(sorted(p.name for p in existing.parent.iterdir()),
+                                 ["rollout-existing.jsonl", "rollout-review.jsonl"])
+                self.assertFalse((codex_home / "sessions" / "linked").exists())
+                self.assertTrue(all(not p.exists() for p in runtime_paths))
+                self.assertIn("advertencia:", errors.getvalue())
+                self.assertFalse((codex_home / "config.toml").exists())
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX directory descriptors")
+    def test_codex_session_failure_keeps_engine_result(self) -> None:
+        for outcome, persist_failure in ((0, False), (0, True), (1, True), (124, True)):
+            with self.subTest(outcome=outcome, persist_failure=persist_failure), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir).resolve()
+                repo = root / "repo"
+                repo.mkdir()
+                home = root / "home"
+                home.mkdir()
+
+                def fake_codex(cmd: list[str], _cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                    day = Path(kwargs["env"]["CODEX_HOME"]) / "sessions/2026/11/12"
+                    day.mkdir(parents=True)
+                    (day / "rollout-review.jsonl").write_text("transcript\n")
+                    return subprocess.CompletedProcess(cmd, outcome, "review result", "engine detail")
+
+                args = argparse.Namespace(tools=True, model=None, stream_engine_output=False)
+                patches = {
+                    "codex_command": lambda *_args, **_kwargs: ["/trusted/codex"],
+                    "run_with_heartbeat": fake_codex,
+                }
+                if persist_failure:
+                    patches["open_session_destination"] = mock.Mock(side_effect=PermissionError("denied"))
+                errors = io.StringIO()
+                with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True), mock.patch.dict(
+                    self.helper["run_codex"].__globals__,
+                    patches,
+                ), contextlib.redirect_stderr(errors):
+                    if outcome == 0:
+                        self.assertEqual(self.helper["run_codex"](args, repo, "review"), "review result")
+                    else:
+                        with self.assertRaisesRegex(SystemExit, rf"codex engine failed \({outcome}\)\nengine detail"):
+                            self.helper["run_codex"](args, repo, "review")
+                if persist_failure:
+                    self.assertIn("denied", errors.getvalue())
+                else:
+                    saved = home / ".codex/sessions/2026/11/12/rollout-review.jsonl"
+                    self.assertEqual(saved.read_text(), "transcript\n")
+                    self.assertEqual(errors.getvalue(), "")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX directory descriptors")
+    def test_codex_session_copy_rejects_symlinked_roots_and_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            source = root / "source"
+            source.mkdir()
+            (source / "rollout-review.jsonl").write_text("transcript\n")
+            linked_source = root / "linked-source"
+            linked_source.symlink_to(source, target_is_directory=True)
+            destination = root / "destination"
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.helper["persist_codex_sessions"](linked_source, destination)
+            self.assertFalse(destination.exists())
+            self.assertIn("advertencia:", errors.getvalue())
+
+            outside = root / "outside"
+            outside.mkdir()
+            destination.symlink_to(outside, target_is_directory=True)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.helper["persist_codex_sessions"](source, destination)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertIn("advertencia:", errors.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX directory descriptors")
+    def test_codex_session_copy_creates_private_dirs_and_cleans_failed_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            source = root / "source/2026/11/12"
+            source.mkdir(parents=True)
+            (source / "rollout-review.jsonl").write_text("transcript\n")
+            destination = root / "home/.codex/sessions"
+            with mock.patch("os.link", side_effect=OSError("publication failed")), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.helper["persist_codex_sessions"](root / "source", destination)
+            self.assertIn("publication failed", errors.getvalue())
+            for path in (root / "home", root / "home/.codex", destination,
+                         destination / "2026", destination / "2026/11", destination / "2026/11/12"):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            self.assertEqual(list((destination / "2026/11/12").iterdir()), [])
+            self.helper["persist_codex_sessions"](root / "source", destination)
+            saved = destination / "2026/11/12/rollout-review.jsonl"
+            self.assertEqual(saved.read_text(), "transcript\n")
+            self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+
     def test_codex_runtime_home_links_only_auth_and_persists_refresh(self) -> None:
         old = os.environ.copy()
         with tempfile.TemporaryDirectory() as tempdir:
