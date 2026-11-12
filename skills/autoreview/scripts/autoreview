@@ -12103,7 +12103,6 @@ def claude_review_isolation_flags() -> list[str]:
 def pi_review_isolation_flags() -> list[str]:
     return [
         "--no-approve",
-        "--no-session",
         "--no-context-files",
         "--no-extensions",
         "--no-skills",
@@ -12627,7 +12626,6 @@ def codex_command(
     cmd.extend(
         [
             *codex_exec_isolation_flags(),
-            "--ephemeral",
             "-C",
             str(review_root),
             "--output-schema",
@@ -12766,7 +12764,6 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         resolve_command(args.claude_bin, repo),
         *claude_review_isolation_flags(),
         "--print",
-        "--no-session-persistence",
         "--output-format",
         "stream-json" if args.stream_engine_output else "json",
         "--json-schema",
@@ -14218,7 +14215,7 @@ if "--version" in args or "-v" in args:
     print(os.environ.get("AUTOREVIEW_FAKE_PI_VERSION", "0.79.0"))
     raise SystemExit(0)
 if "--help" in args or "-h" in args:
-    print(os.environ.get("AUTOREVIEW_FAKE_PI_HELP", "--print\n--no-approve\n--no-session\n--no-context-files\n--no-extensions\n--no-skills\n--no-prompt-templates\n--no-themes\n--tools\n--no-tools\n--thinking"))
+    print(os.environ.get("AUTOREVIEW_FAKE_PI_HELP", "--print\n--no-approve\n--no-context-files\n--no-extensions\n--no-skills\n--no-prompt-templates\n--no-themes\n--tools\n--no-tools\n--thinking"))
     raise SystemExit(0)
 record = os.environ["AUTOREVIEW_FAKE_RECORD"]
 Path(record).write_text(json.dumps({"argv": args, "cwd": os.getcwd(), "stdin": sys.stdin.read()}))
@@ -14431,10 +14428,11 @@ def self_test_engine_isolation() -> int:
                 'forced_chatgpt_workspace_id=["workspace-one", "workspace-two"]',
                 'default_permissions="autoreview"',
                 'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
-                "--ephemeral",
             ]:
                 if required not in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: missing {required}")
+            if "--ephemeral" in codex_argv:
+                raise SystemExit("codex isolation self-test failed: persistence disabled (--ephemeral); sessions must be kept")
             for forbidden in ["hostile-user-model", "read-only"]:
                 if forbidden in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: leaked {forbidden}")
@@ -14455,6 +14453,8 @@ def self_test_engine_isolation() -> int:
             for required in claude_review_isolation_flags():
                 if required not in claude_argv:
                     raise SystemExit(f"claude isolation self-test failed: missing {required}")
+            if "--no-session-persistence" in claude_argv:
+                raise SystemExit("claude isolation self-test failed: persistence disabled; sessions must be kept")
             allowed_tools = claude_allowed_tools(args)
             for required in ["--tools", allowed_tools, "--allowedTools"]:
                 if required not in claude_argv:
@@ -14480,6 +14480,8 @@ def self_test_engine_isolation() -> int:
             for forbidden in ["--tools", "read,grep,find,ls"]:
                 if forbidden in pi_argv:
                     raise SystemExit(f"pi isolation self-test failed: unsafe {forbidden}")
+            if "--no-session" in pi_argv:
+                raise SystemExit("pi isolation self-test failed: persistence disabled (--no-session); sessions must be kept")
             if Path(pi_record["cwd"]).resolve() == repo.resolve():
                 raise SystemExit("pi isolation self-test failed: review ran inside hostile repo")
             if str(repo) not in pi_record["stdin"]:
@@ -14560,7 +14562,7 @@ def self_test_engine_isolation() -> int:
                 raise SystemExit("pi version floor self-test failed")
 
             os.environ["AUTOREVIEW_FAKE_PI_VERSION"] = "0.79.0"
-            os.environ["AUTOREVIEW_FAKE_PI_HELP"] = "--print\n--no-session\n--no-context-files\n--no-extensions\n--no-skills\n--no-prompt-templates\n--no-themes\n--tools\n--no-tools\n--thinking"
+            os.environ["AUTOREVIEW_FAKE_PI_HELP"] = "--print\n--no-context-files\n--no-extensions\n--no-skills\n--no-prompt-templates\n--no-themes\n--tools\n--no-tools\n--thinking"
             try:
                 ensure_pi_isolation_supported(args, repo)
             except SystemExit as exc:

@@ -7772,7 +7772,7 @@ else:
             cli = self.write_pipe_truncating_cli(
                 root / "pi",
                 "1.4.0",
-                "--print --no-approve --no-session --no-context-files --no-extensions "
+                "--print --no-approve --no-context-files --no-extensions "
                 "--no-skills --no-prompt-templates --no-themes --no-tools --thinking",
             )
             args = argparse.Namespace(pi_bin=str(cli))
@@ -7780,6 +7780,12 @@ else:
             cli.write_text(cli.read_text().replace("--no-context-files", "--context-files"))
             with self.assertRaisesRegex(SystemExit, "missing from --help: --no-context-files \\(--help exit 0, "):
                 self.helper["ensure_pi_isolation_supported"](args, repo)
+
+    def test_review_engines_keep_their_sessions(self) -> None:
+        # Persistence-disabling flags would hide the run from claude-usage.
+        self.assertNotIn("--no-session", self.helper["pi_review_isolation_flags"]())
+        self.assertNotIn("--no-session-persistence", self.helper["claude_review_isolation_flags"]())
+        self.assertIn("--no-approve", self.helper["pi_review_isolation_flags"]())
 
     def test_exit_message_keeps_the_engine_error_tail(self) -> None:
         echoed_prompt = "user\n" + "Review the change bundle.\n" * 1000
